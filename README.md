@@ -1,2 +1,2 @@
-# iOSSimulatorManager
-iOS模拟器管理
+# iOS模拟器管理
+方便控制Mac上安装的iOS模拟器的开闭状态
