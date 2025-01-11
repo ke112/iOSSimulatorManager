@@ -4,8 +4,7 @@
 <img src="assets/images/icon-1024.png" width="200" height="200" alt="App Icon">
 
 #### 最新版本
-[📥 下载 iOS模拟器管理工具 v0.0.1](https://github.com/ke112/iOSSimulatorManager/assets/file/newVersion/)
-
+[📥 下载 iOS模拟器管理工具](https://raw.githubusercontent.com/ke112/iOSSimulatorManager/main/dist/iOSSimulatorManager.app.zip)
 
 ## 贡献
 
