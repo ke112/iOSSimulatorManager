@@ -1,5 +1,6 @@
 ## iOS模拟器管理
 方便控制Mac上安装的iOS模拟器的开闭状态
+
 <img src="assets/images/icon-1024.png" width="200" height="200" alt="App Icon">
 
 ## 贡献
