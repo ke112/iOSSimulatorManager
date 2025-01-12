@@ -1,8 +1,6 @@
 ## iOS模拟器管理
 方便控制Mac上安装的iOS模拟器的开闭状态
 
-<img src="assets/images/icon-1024.png" width="200" height="200" alt="App Icon">
-
 #### 最新版本
 [📥 下载 iOS模拟器管理工具](https://github.com/ke112/iOSSimulatorManager/raw/refs/heads/main/assets/newVersion/iOS模拟器管理.zip)
 
