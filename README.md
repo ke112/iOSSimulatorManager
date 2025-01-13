@@ -18,7 +18,7 @@
 这个项目会持续更新。如果你有新的想法，欢迎提交 issues 或 pull requests 到 [GitHub Repository](https://github.com/ke112/iOSSimulatorManager/)，空闲时我会添加新功能。
 
 
-## 联系联系
+## 联系
 作者 : 徐凤年
 
 微信 : zhang1102d
