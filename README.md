@@ -2,9 +2,10 @@
 方便控制Mac上安装的iOS模拟器的开闭状态
 
 ## 使用
-#### 最新版本 [📥 下载](https://github.com/ke112/iOSSimulatorManager/raw/refs/heads/main/assets/newVersion/iOS模拟器管理.zip)
+### 最新版本 [📥 下载](https://github.com/ke112/iOSSimulatorManager/raw/refs/heads/main/assets/newVersion/iOS模拟器管理.zip)
+### 如果点击下载不好用, 可前往百度云下载 [百度云下载](https://pan.baidu.com/s/18YqR07A5fJNtgyqj_hmZHg?pwd=6688)
 
-#### 将下载的.zip解压得到.app, 放到应用程序中
+### 将下载的.zip解压得到.app, 放到应用程序中
 如果出现"无法打开xxx弹窗", 请执行以下命令后就可以打开.app
 
 ```sudo xattr -r -d com.apple.quarantine /Applications/iOS模拟器管理.app```
