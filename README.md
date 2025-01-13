@@ -7,6 +7,7 @@
 
 #### 将下载的.zip解压得到.app, 放到应用程序中
 如果出现"无法打开xxx弹窗", 请执行以下命令后就可以打开.app
+
 sudo xattr -r -d com.apple.quarantine /Applications/iOS模拟器管理.app
 
 
