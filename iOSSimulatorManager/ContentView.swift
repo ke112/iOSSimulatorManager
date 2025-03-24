@@ -3,7 +3,7 @@ import SwiftUI
 // 主界面布局UI
 struct ContentView: View {
     @StateObject private var simulatorManager = SimulatorManager()
-    
+
     var body: some View {
         /// 设备列表
         List(simulatorManager.devices) { device in
@@ -25,9 +25,9 @@ struct ContentView: View {
                             .lineLimit(1)
                     }
                 }
-                
+
                 Spacer()
-                
+
                 // 右侧开关
                 Toggle("", isOn: Binding(
                     get: { device.state == "Booted" },
@@ -49,4 +49,4 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-} 
+}

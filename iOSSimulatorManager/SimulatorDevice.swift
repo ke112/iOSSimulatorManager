@@ -7,12 +7,12 @@ struct SimulatorDevice: Identifiable {
     let name: String
     let state: String
     let runtime: String
-    
+
     init(udid: String, name: String, state: String, runtime: String) {
-        self.id = udid
+        id = udid
         self.udid = udid
         self.name = name
         self.state = state
         self.runtime = runtime
     }
-} 
+}

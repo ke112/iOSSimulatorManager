@@ -23,7 +23,7 @@ struct iOSSimulatorManagerApp: App {
                     NSApplication.shared.orderFrontStandardAboutPanel()
                 }
             }
-            
+
             // 添加帮助菜单
             CommandGroup(replacing: .help) {
                 Button("帮助") {
