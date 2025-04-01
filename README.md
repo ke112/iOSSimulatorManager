@@ -1,6 +1,8 @@
 ## iOS模拟器管理
 方便控制Mac上安装的iOS模拟器的开闭状态
 
+![示例图片](assets/images/img1.png)
+
 ## 使用
 ### 最新版本 [📥 下载](https://github.com/ke112/iOSSimulatorManager/raw/refs/heads/main/assets/newVersion/iOS模拟器管理.zip)
 ### 如果点击下载不好用, 可前往百度云下载 [百度云下载](https://pan.baidu.com/s/18YqR07A5fJNtgyqj_hmZHg?pwd=6688)
