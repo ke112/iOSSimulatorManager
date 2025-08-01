@@ -1,5 +1,29 @@
 {
   "devices": {
+    "iPhone 17 Pro Max": {
+      "screenSize": 6.9,
+      "resolution": "1320*2868",
+      "logicalResolution": "430*932",
+      "deviceType": "iPhone"
+    },
+    "iPhone 17 Pro": {
+      "screenSize": 6.3,
+      "resolution": "1206*2622",
+      "logicalResolution": "393*852",
+      "deviceType": "iPhone"
+    },
+    "iPhone 17 Air": {
+      "screenSize": 6.6,
+      "resolution": "1290*2796",
+      "logicalResolution": "428*926",
+      "deviceType": "iPhone"
+    },
+    "iPhone 17": {
+      "screenSize": 6.3,
+      "resolution": "1206*2622",
+      "logicalResolution": "393*852",
+      "deviceType": "iPhone"
+    },
     "iPhone 16 Pro Max": {
       "screenSize": 6.9,
       "resolution": "1320*2868",
@@ -44,8 +68,8 @@
     },
     "iPhone 15": {
       "screenSize": 6.1,
-      "resolution": "1170*2532",
-      "logicalResolution": "390*844",
+      "resolution": "1179*2556",
+      "logicalResolution": "393*852",
       "deviceType": "iPhone"
     },
     "iPhone 14 Pro Max": {
@@ -120,11 +144,47 @@
       "logicalResolution": "375*812",
       "deviceType": "iPhone"
     },
+    "iPhone SE (3rd generation)": {
+      "screenSize": 4.7,
+      "resolution": "750*1334",
+      "logicalResolution": "375*667",
+      "deviceType": "iPhone"
+    },
+    "iPhone SE (2nd generation)": {
+      "screenSize": 4.7,
+      "resolution": "750*1334",
+      "logicalResolution": "375*667",
+      "deviceType": "iPhone"
+    },
     "iPhone SE": {
       "screenSize": 4.7,
       "resolution": "750*1334",
       "logicalResolution": "375*667",
       "deviceType": "iPhone"
+    },
+    "iPad Pro (13-inch) (M4)": {
+      "screenSize": 13.0,
+      "resolution": "2064*2752",
+      "logicalResolution": "1032*1376",
+      "deviceType": "iPad"
+    },
+    "iPad Pro (11-inch) (M4)": {
+      "screenSize": 11.0,
+      "resolution": "1668*2420",
+      "logicalResolution": "834*1210",
+      "deviceType": "iPad"
+    },
+    "iPad Pro (12.9-inch) (6th generation)": {
+      "screenSize": 12.9,
+      "resolution": "2048*2732",
+      "logicalResolution": "1024*1366",
+      "deviceType": "iPad"
+    },
+    "iPad Pro (11-inch) (4th generation)": {
+      "screenSize": 11.0,
+      "resolution": "1668*2388",
+      "logicalResolution": "834*1194",
+      "deviceType": "iPad"
     },
     "iPad Pro (12.9-inch)": {
       "screenSize": 12.9,
@@ -138,16 +198,64 @@
       "logicalResolution": "834*1194",
       "deviceType": "iPad"
     },
+    "iPad Air (13-inch) (M2)": {
+      "screenSize": 13.0,
+      "resolution": "2732*2048",
+      "logicalResolution": "1366*1024",
+      "deviceType": "iPad"
+    },
+    "iPad Air (11-inch) (M2)": {
+      "screenSize": 11.0,
+      "resolution": "2360*1640",
+      "logicalResolution": "1180*820",
+      "deviceType": "iPad"
+    },
+    "iPad Air (5th generation)": {
+      "screenSize": 10.9,
+      "resolution": "1640*2360",
+      "logicalResolution": "820*1180",
+      "deviceType": "iPad"
+    },
+    "iPad Air (4th generation)": {
+      "screenSize": 10.9,
+      "resolution": "1640*2360",
+      "logicalResolution": "820*1180",
+      "deviceType": "iPad"
+    },
     "iPad Air": {
       "screenSize": 10.9,
       "resolution": "1640*2360",
       "logicalResolution": "820*1180",
       "deviceType": "iPad"
     },
+    "iPad mini (A17 Pro)": {
+      "screenSize": 8.3,
+      "resolution": "1488*2266",
+      "logicalResolution": "744*1133",
+      "deviceType": "iPad"
+    },
+    "iPad mini (6th generation)": {
+      "screenSize": 8.3,
+      "resolution": "1488*2266",
+      "logicalResolution": "744*1133",
+      "deviceType": "iPad"
+    },
     "iPad mini": {
       "screenSize": 8.3,
       "resolution": "1488*2266",
       "logicalResolution": "744*1133",
+      "deviceType": "iPad"
+    },
+    "iPad (10th generation)": {
+      "screenSize": 10.9,
+      "resolution": "1640*2360",
+      "logicalResolution": "820*1180",
+      "deviceType": "iPad"
+    },
+    "iPad (9th generation)": {
+      "screenSize": 10.2,
+      "resolution": "1620*2160",
+      "logicalResolution": "810*1080",
       "deviceType": "iPad"
     },
     "iPad": {
