@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 // 设备管理类
-class SimulatorManager: ObservableObject {
+class SimulatorManager: ObservableObject, ErrorHandler {
     // 分组后的设备列表
     @Published var deviceGroups: [DeviceGroup] = []
     // 保持原有设备列表属性，保证兼容性
@@ -14,6 +14,15 @@ class SimulatorManager: ObservableObject {
 
     private var timer: Timer?
     private var isOperating = false
+    private var refreshTask: DispatchWorkItem?
+    private var deviceCache: [SimulatorDevice] = []
+    private var lastRefreshTime: Date = Date.distantPast
+    private let refreshInterval: TimeInterval = 5.0 // 增加到5秒
+    private let cacheValidTime: TimeInterval = 2.0 // 缓存有效期2秒
+    
+    // 错误处理
+    @Published var lastError: String? = nil
+    @Published var hasError: Bool = false
 
     /// 设备分组模型
     struct DeviceGroup: Identifiable {
@@ -31,11 +40,11 @@ class SimulatorManager: ObservableObject {
             DispatchQueue.main.async {
                 self?.refreshDevices()
 
-                // 创建定时器，实时更新
-                self?.timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) {
+                // 创建定时器，实时更新 - 使用更长间隔
+                self?.timer = Timer.scheduledTimer(withTimeInterval: self?.refreshInterval ?? 5.0, repeats: true) {
                     [weak self] _ in
                     guard let self = self, !self.isOperating else { return }
-                    self.refreshDevices()
+                    self.refreshDevicesWithDebounce()
                 }
             }
         }
@@ -72,9 +81,39 @@ class SimulatorManager: ObservableObject {
         }
     }
 
+    /// 带防抖的刷新设备列表
+    private func refreshDevicesWithDebounce() {
+        // 取消之前的刷新任务
+        refreshTask?.cancel()
+        
+        // 创建新的刷新任务
+        refreshTask = DispatchWorkItem { [weak self] in
+            self?.refreshDevices()
+        }
+        
+        // 延迟执行，防抖
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: refreshTask!)
+    }
+    
     /// 刷新设备列表
     func refreshDevices() {
         guard !isOperating else { return }
+        
+        PerformanceMonitor.shared.startOperation("refreshDevices")
+        
+        // 检查缓存是否有效
+        let now = Date()
+        if now.timeIntervalSince(lastRefreshTime) < cacheValidTime && !deviceCache.isEmpty {
+            PerformanceMonitor.shared.logDebug("使用缓存数据，跳过刷新")
+            DispatchQueue.main.async {
+                if !self.hasInitialLoadCompleted {
+                    self.hasInitialLoadCompleted = true
+                    self.isLoading = false
+                }
+            }
+            PerformanceMonitor.shared.endOperation("refreshDevices")
+            return
+        }
 
         // 如果是初次加载，显示loading状态
         if !hasInitialLoadCompleted {
@@ -144,7 +183,9 @@ class SimulatorManager: ObservableObject {
                         return device1.name < device2.name
                     }
 
-                    // 更新原有的设备列表（保持兼容）
+                    // 更新缓存和设备列表
+                    self.deviceCache = allDevices
+                    self.lastRefreshTime = Date()
                     self.devices = allDevices
 
                     // 按运行时版本分组设备
@@ -204,15 +245,20 @@ class SimulatorManager: ObservableObject {
                     self.hasInitialLoadCompleted = true
                     self.isLoading = false
                 }
+                
+                PerformanceMonitor.shared.endOperation("refreshDevices")
             }
         } catch {
-            print("Error refreshing devices: \(error)")
+            PerformanceMonitor.shared.logError(error, operation: "refreshDevices")
+            handleError(SimulatorError.commandExecutionFailed(error.localizedDescription))
             DispatchQueue.main.async {
                 // 即使出错也要结束loading状态
                 if !self.hasInitialLoadCompleted {
                     self.hasInitialLoadCompleted = true
                     self.isLoading = false
                 }
+                
+                PerformanceMonitor.shared.endOperation("refreshDevices")
             }
         }
     }
@@ -362,7 +408,7 @@ class SimulatorManager: ObservableObject {
             process.arguments = ["-a", "Simulator"]
             try process.run()
         } catch {
-            print("Error opening Simulator app: \(error)")
+            handleError(SimulatorError.commandExecutionFailed("无法打开模拟器应用: \(error.localizedDescription)"))
         }
     }
 
@@ -375,7 +421,7 @@ class SimulatorManager: ObservableObject {
             try process.run()
             process.waitUntilExit()
         } catch {
-            print("Error executing simctl command: \(error)")
+            handleError(SimulatorError.commandExecutionFailed("命令执行失败: \(error.localizedDescription)"))
         }
     }
 
@@ -396,6 +442,40 @@ class SimulatorManager: ObservableObject {
                 }
             }
         }
+    }
+    
+    // MARK: - ErrorHandler
+    func handleError(_ error: Error) {
+        PerformanceMonitor.shared.logError(error)
+        
+        DispatchQueue.main.async {
+            self.lastError = error.localizedDescription
+            self.hasError = true
+            
+            // 3秒后自动清除错误
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                self.hasError = false
+                self.lastError = nil
+            }
+        }
+        
+        // 仍然打印到控制台用于调试
+        print("SimulatorManager Error: \(error.localizedDescription)")
+    }
+    
+    /// 清除错误状态
+    func clearError() {
+        DispatchQueue.main.async {
+            self.hasError = false
+            self.lastError = nil
+        }
+    }
+    
+    /// 强制刷新（忽略缓存）
+    func forceRefresh() {
+        lastRefreshTime = Date.distantPast
+        deviceCache.removeAll()
+        refreshDevices()
     }
 }
 

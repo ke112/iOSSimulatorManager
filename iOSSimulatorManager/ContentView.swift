@@ -170,7 +170,7 @@ struct ContentView: View {
             } else if simulatorManager.deviceGroups.isEmpty {
                 // 空状态
                 EmptyStateView(onRefresh: {
-                    simulatorManager.manualRefresh()
+                    simulatorManager.forceRefresh()
                 })
             } else {
                 // 设备列表
@@ -193,6 +193,34 @@ struct ContentView: View {
                 }
             }
 
+            // 显示错误提示
+            if simulatorManager.hasError, let errorMessage = simulatorManager.lastError {
+                VStack {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.red)
+                        Text(errorMessage)
+                            .foregroundColor(.red)
+                            .font(.caption)
+                        
+                        Spacer()
+                        
+                        Button("关闭") {
+                            simulatorManager.clearError()
+                        }
+                        .font(.caption)
+                        .foregroundColor(.blue)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(8)
+                    .padding(.horizontal, 16)
+                    
+                    Spacer()
+                }
+            }
+            
             // 显示吐司提示
             if showingToast {
                 VStack {
