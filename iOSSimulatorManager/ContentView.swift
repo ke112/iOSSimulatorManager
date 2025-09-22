@@ -284,7 +284,7 @@ struct DeviceRow: View {
                                 Text(device.logicalResolution)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
-                                    .frame(maxWidth: 50, alignment: .leading)  // 设置最大宽度
+                                    .frame(maxWidth: 60, alignment: .leading)  // 设置最大宽度
                                     .background(backColor)
                             }
                         }
