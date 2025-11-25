@@ -159,6 +159,8 @@ struct ContentView: View {
     @StateObject private var simulatorManager = SimulatorManager()
     @State private var showingToast = false
     @State private var toastMessage = ""
+    @State private var showingDeleteConfirm = false
+    @State private var runtimeToDelete: SimulatorManager.DeviceGroup? = nil
 
     var body: some View {
         /// 设备列表（分组显示）
@@ -176,7 +178,39 @@ struct ContentView: View {
                 // 设备列表
                 List {
                     ForEach(simulatorManager.deviceGroups) { group in
-                        Section(header: Text(group.displayName).font(.headline)) {
+                        Section(header: 
+                            HStack {
+                                Text(group.displayName)
+                                    .font(.headline)
+                                Spacer()
+                                // 创建模拟器按钮
+                                Button(action: {
+                                    simulatorManager.createDefaultDevices(for: group.runtime)
+                                    toastMessage = "正在创建 \(group.displayName) 模拟器..."
+                                    withAnimation {
+                                        showingToast = true
+                                    }
+                                }) {
+                                    Image(systemName: "plus.circle")
+                                        .font(.caption)
+                                        .foregroundColor(.green.opacity(0.8))
+                                }
+                                .buttonStyle(.plain)
+                                .help("创建该版本的常用模拟器")
+                                
+                                // 删除按钮
+                                Button(action: {
+                                    runtimeToDelete = group
+                                    showingDeleteConfirm = true
+                                }) {
+                                    Image(systemName: "trash")
+                                        .font(.caption)
+                                        .foregroundColor(.red.opacity(0.8))
+                                }
+                                .buttonStyle(.plain)
+                                .help("删除该版本的所有模拟器")
+                            }
+                        ) {
                             ForEach(group.devices) { device in
                                 DeviceRow(
                                     device: device,
@@ -230,7 +264,40 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(width: 600, height: 500)  // 增加宽度以容纳更多内容
+        .frame(width: 650, height: 500)  // 增加宽度以容纳更多内容
+        .confirmationDialog(
+            "删除 \(runtimeToDelete?.displayName ?? "") 版本",
+            isPresented: $showingDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("仅删除模拟器设备", role: .destructive) {
+                if let group = runtimeToDelete {
+                    simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: false)
+                    toastMessage = "已删除 \(group.displayName) 的 \(group.devices.count) 个模拟器"
+                    withAnimation {
+                        showingToast = true
+                    }
+                }
+                runtimeToDelete = nil
+            }
+            Button("彻底删除（含 Runtime 镜像）", role: .destructive) {
+                if let group = runtimeToDelete {
+                    simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: true)
+                    toastMessage = "已彻底删除 \(group.displayName) 及其 Runtime"
+                    withAnimation {
+                        showingToast = true
+                    }
+                }
+                runtimeToDelete = nil
+            }
+            Button("取消", role: .cancel) {
+                runtimeToDelete = nil
+            }
+        } message: {
+            if let group = runtimeToDelete {
+                Text("共 \(group.devices.count) 个设备\n\n• 仅删除设备：删除模拟器及其数据\n• 彻底删除：同时删除 iOS Runtime 镜像（释放 5-10GB 空间）")
+            }
+        }
     }
 }
 

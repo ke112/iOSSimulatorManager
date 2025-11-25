@@ -16,6 +16,7 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     private var isOperating = false
     private var refreshTask: DispatchWorkItem?
     private var deviceCache: [SimulatorDevice] = []
+    private var runtimeCache: Set<String> = []  // 已安装 Runtime 缓存
     private var lastRefreshTime: Date = Date.distantPast
     private let refreshInterval: TimeInterval = 5.0 // 增加到5秒
     private let cacheValidTime: TimeInterval = 2.0 // 缓存有效期2秒
@@ -136,6 +137,9 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let decoder = JSONDecoder()
             let result = try decoder.decode(SimctlListResponse.self, from: data)
+            
+            // 在后台线程获取已安装的 Runtime 列表（避免阻塞主线程）
+            let installedRuntimes = Set(self.getInstalledRuntimes())
 
             DispatchQueue.main.async {
                 // 创建所有设备的列表
@@ -149,10 +153,14 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                         )
                     }
                 }
-
-                // 检查数据是否有变化，如果没有变化则不更新UI
-                if self.hasDevicesChanged(newDevices: allDevices) {
+                
+                // 检查数据是否有变化（设备或 Runtime），如果没有变化则不更新UI
+                let devicesChanged = self.hasDevicesChanged(newDevices: allDevices)
+                let runtimesChanged = installedRuntimes != self.runtimeCache
+                
+                if devicesChanged || runtimesChanged {
                     // 数据有变化，执行更新
+                    self.runtimeCache = installedRuntimes
 
                     // 按版本号排序所有设备
                     allDevices.sort { (device1, device2) -> Bool in
@@ -190,7 +198,18 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
                     // 按运行时版本分组设备
                     var groups: [String: DeviceGroup] = [:]
+                    
+                    // 1. 首先为所有已安装的 Runtime 创建空的分组
+                    for runtime in installedRuntimes {
+                        let displayName = self.formatRuntimeName(runtime)
+                        groups[runtime] = DeviceGroup(
+                            runtime: runtime,
+                            displayName: displayName,
+                            devices: []
+                        )
+                    }
 
+                    // 2. 将设备添加到对应的分组
                     for device in allDevices {
                         let runtimeKey = device.runtime
                         let displayName = self.formatRuntimeName(runtimeKey)
@@ -331,6 +350,45 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
         // 如果无法解析，返回默认较低优先级
         return 0.0
+    }
+    
+    /// 获取所有已安装的 iOS Runtime 标识符列表
+    /// - Returns: Runtime 标识符数组，如 ["com.apple.CoreSimulator.SimRuntime.iOS-17-5", ...]
+    private func getInstalledRuntimes() -> [String] {
+        do {
+            let process = Process()
+            let pipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = ["simctl", "list", "runtimes", "-j"]
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            
+            try process.run()
+            process.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            
+            // 解析 JSON
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let runtimes = json["runtimes"] as? [[String: Any]] {
+                
+                var runtimeIdentifiers: [String] = []
+                for runtimeInfo in runtimes {
+                    // 只获取 iOS runtime，且为可用状态
+                    if let identifier = runtimeInfo["identifier"] as? String,
+                       let isAvailable = runtimeInfo["isAvailable"] as? Bool,
+                       identifier.contains("iOS"),
+                       isAvailable {
+                        runtimeIdentifiers.append(identifier)
+                    }
+                }
+                return runtimeIdentifiers
+            }
+        } catch {
+            print("获取已安装 Runtime 失败: \(error.localizedDescription)")
+        }
+        return []
     }
 
     /// 开启设备
@@ -476,6 +534,262 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         lastRefreshTime = Date.distantPast
         deviceCache.removeAll()
         refreshDevices()
+    }
+    
+    /// 删除指定 runtime 版本的所有模拟器
+    /// - Parameters:
+    ///   - runtime: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+    ///   - deleteRuntime: 是否同时删除 iOS Runtime 镜像（彻底删除）
+    func deleteDevicesForRuntime(_ runtime: String, deleteRuntime: Bool = false) {
+        isOperating = true
+        
+        // 获取该 runtime 下的所有设备
+        guard let group = deviceGroups.first(where: { $0.runtime == runtime }) else {
+            isOperating = false
+            return
+        }
+        
+        // 在后台线程执行删除操作
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 1. 先删除所有模拟器设备
+            for device in group.devices {
+                // 如果设备正在运行，先关闭
+                if device.state == "Booted" {
+                    self?.executeSimctlCommand(arguments: ["shutdown", device.udid])
+                    // 等待关闭完成
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
+                
+                // 删除设备
+                self?.executeSimctlCommand(arguments: ["delete", device.udid])
+            }
+            
+            // 2. 如果需要，删除 Runtime 镜像
+            if deleteRuntime {
+                // 等待设备删除完成
+                Thread.sleep(forTimeInterval: 1.0)
+                
+                // 获取 Runtime UUID 并删除
+                if let runtimeUUID = self?.getRuntimeUUID(for: runtime) {
+                    self?.deleteRuntimeWithPrivileges(uuid: runtimeUUID)
+                }
+            }
+            
+            // 完成后刷新设备列表
+            DispatchQueue.main.async {
+                self?.isOperating = false
+                self?.forceRefresh()
+            }
+        }
+    }
+    
+    /// 获取 Runtime 的 UUID
+    /// - Parameter runtimeIdentifier: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+    /// - Returns: Runtime 的 UUID，如 "1F27DC46-D37C-4CC2-A186-BE0931583640"
+    private func getRuntimeUUID(for runtimeIdentifier: String) -> String? {
+        do {
+            let process = Process()
+            let pipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = ["simctl", "runtime", "list", "-j"]
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            
+            try process.run()
+            process.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            
+            // 解析 JSON 获取 UUID
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+                for (uuid, info) in json {
+                    if let identifier = info["runtimeIdentifier"] as? String,
+                       identifier == runtimeIdentifier {
+                        return uuid
+                    }
+                }
+            }
+        } catch {
+            print("获取 Runtime UUID 失败: \(error.localizedDescription)")
+        }
+        return nil
+    }
+    
+    /// 使用管理员权限删除 Runtime
+    /// - Parameter uuid: Runtime 的 UUID
+    private func deleteRuntimeWithPrivileges(uuid: String) {
+        // 使用 AppleScript 请求管理员权限执行删除命令
+        let script = """
+        do shell script "xcrun simctl runtime delete \(uuid)" with administrator privileges
+        """
+        
+        var error: NSDictionary?
+        if let appleScript = NSAppleScript(source: script) {
+            appleScript.executeAndReturnError(&error)
+            
+            if let error = error {
+                print("删除 Runtime 失败: \(error)")
+                DispatchQueue.main.async {
+                    self.handleError(SimulatorError.commandExecutionFailed("删除 Runtime 失败，可能需要手动执行: sudo xcrun simctl runtime delete \(uuid)"))
+                }
+            } else {
+                print("Runtime \(uuid) 删除成功")
+            }
+        }
+    }
+    
+    /// 为指定 Runtime 创建所有支持的模拟器设备
+    /// - Parameter runtime: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+    func createDefaultDevices(for runtime: String) {
+        isOperating = true
+        
+        // 获取当前已存在的设备名称
+        let existingDeviceNames = Set(deviceGroups
+            .first(where: { $0.runtime == runtime })?
+            .devices.map { $0.name } ?? [])
+        
+        // 在后台线程执行创建操作
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // 1. 获取该 runtime 支持的所有设备类型
+            let supportedDeviceTypes = self?.getSupportedDeviceTypes(for: runtime) ?? []
+            
+            if supportedDeviceTypes.isEmpty {
+                print("未找到 runtime \(runtime) 支持的设备类型")
+                DispatchQueue.main.async {
+                    self?.isOperating = false
+                    self?.handleError(SimulatorError.commandExecutionFailed("未找到该 Runtime 支持的设备类型"))
+                }
+                return
+            }
+            
+            var createdCount = 0
+            
+            // 2. 创建所有支持的设备
+            for deviceType in supportedDeviceTypes {
+                // 跳过已存在的设备
+                if existingDeviceNames.contains(deviceType.name) {
+                    continue
+                }
+                
+                if self?.createSimulatorDevice(name: deviceType.name, deviceType: deviceType.identifier, runtime: runtime) == true {
+                    createdCount += 1
+                }
+            }
+            
+            // 完成后刷新设备列表
+            DispatchQueue.main.async {
+                self?.isOperating = false
+                self?.forceRefresh()
+                print("成功创建 \(createdCount) 个模拟器设备")
+            }
+        }
+    }
+    
+    /// 获取指定 runtime 支持的设备类型列表
+    /// - Parameter runtime: runtime 标识符
+    /// - Returns: 支持的设备类型数组
+    private func getSupportedDeviceTypes(for runtime: String) -> [SupportedDeviceType] {
+        do {
+            let process = Process()
+            let pipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = ["simctl", "list", "runtimes", "-j"]
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            
+            try process.run()
+            process.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            
+            // 解析 JSON
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let runtimes = json["runtimes"] as? [[String: Any]] {
+                
+                // 查找匹配的 runtime
+                for runtimeInfo in runtimes {
+                    guard let identifier = runtimeInfo["identifier"] as? String,
+                          identifier == runtime,
+                          let supportedTypes = runtimeInfo["supportedDeviceTypes"] as? [[String: Any]] else {
+                        continue
+                    }
+                    
+                    // 解析支持的设备类型
+                    var deviceTypes: [SupportedDeviceType] = []
+                    for typeInfo in supportedTypes {
+                        if let name = typeInfo["name"] as? String,
+                           let typeIdentifier = typeInfo["identifier"] as? String,
+                           let productFamily = typeInfo["productFamily"] as? String {
+                            // 只添加 iPhone 和 iPad
+                            if productFamily == "iPhone" || productFamily == "iPad" {
+                                deviceTypes.append(SupportedDeviceType(
+                                    name: name,
+                                    identifier: typeIdentifier,
+                                    productFamily: productFamily
+                                ))
+                            }
+                        }
+                    }
+                    
+                    // 按设备类型排序：iPhone 在前，iPad 在后
+                    deviceTypes.sort { dt1, dt2 in
+                        if dt1.productFamily != dt2.productFamily {
+                            return dt1.productFamily == "iPhone"
+                        }
+                        return dt1.name < dt2.name
+                    }
+                    
+                    return deviceTypes
+                }
+            }
+        } catch {
+            print("获取支持的设备类型失败: \(error.localizedDescription)")
+        }
+        return []
+    }
+    
+    /// 支持的设备类型结构
+    private struct SupportedDeviceType {
+        let name: String
+        let identifier: String
+        let productFamily: String
+    }
+    
+    /// 创建单个模拟器设备
+    /// - Parameters:
+    ///   - name: 设备名称
+    ///   - deviceType: 设备类型标识符
+    ///   - runtime: runtime 标识符
+    /// - Returns: 是否创建成功
+    private func createSimulatorDevice(name: String, deviceType: String, runtime: String) -> Bool {
+        do {
+            let process = Process()
+            let pipe = Pipe()
+            
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = ["simctl", "create", name, deviceType, runtime]
+            process.standardOutput = pipe
+            process.standardError = pipe
+            
+            try process.run()
+            process.waitUntilExit()
+            
+            if process.terminationStatus == 0 {
+                print("创建成功: \(name)")
+                return true
+            } else {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let error = String(data: data, encoding: .utf8) {
+                    print("创建失败 \(name): \(error)")
+                }
+                return false
+            }
+        } catch {
+            print("创建执行失败 \(name): \(error.localizedDescription)")
+            return false
+        }
     }
 }
 
