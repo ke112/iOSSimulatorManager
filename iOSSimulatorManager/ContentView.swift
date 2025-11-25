@@ -256,9 +256,6 @@ struct DeviceRow: View {
 
                     // 显示设备类型和尺寸信息
                     if device.screenSize > 0 {
-                        Text("•")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
                         Text("\(String(format: "%.1f", device.screenSize))\"")
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -291,11 +288,22 @@ struct DeviceRow: View {
                     }
                 }
 
-                // 设备状态行
-                Text("State: \(device.state)")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                // 设备状态行和UDID
+                HStack(spacing: 8) {
+                    Text("State: \(device.state)")
+                        .font(.subheadline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)  // 如果文本太长，在末尾截断
+                        .frame(maxWidth: 180, alignment: .leading)  // 设置最大宽度，避免挤压屏幕尺寸信息
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    
+                    Text("UDID: \(device.udid)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)  // 中间截断，保留首尾
+                }
             }
             .contentShape(Rectangle())  // 确保整个区域可点击
             .onTapGesture {
@@ -340,6 +348,9 @@ struct DeviceRow: View {
         if !device.logicalResolution.isEmpty {
             infoString += "\n屏幕点• \(device.logicalResolution)"
         }
+        
+        // 添加UDID信息
+        infoString += "\nUDID• \(device.udid)"
 
         // 复制到剪贴板
         let pasteboard = NSPasteboard.general
