@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -638,10 +639,50 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             }
         }
     }
+
+    /// 在 Finder 中显示当前 Runtime 下的模拟器设备目录
+    /// - Parameter runtimeIdentifier: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+    func showSimulatorsInFinder(for runtimeIdentifier: String) {
+        guard let group = deviceGroups.first(where: { $0.runtime == runtimeIdentifier }) else {
+            handleError(SimulatorError.commandExecutionFailed("未找到该版本的模拟器分组"))
+            return
+        }
+
+        guard !group.devices.isEmpty else {
+            handleError(SimulatorError.commandExecutionFailed("该版本当前还没有模拟器目录"))
+            return
+        }
+
+        let simulatorRoot = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Developer/CoreSimulator/Devices")
+        let fileManager = FileManager.default
+        let urls = group.devices.compactMap { device -> URL? in
+            let path = (simulatorRoot as NSString).appendingPathComponent(device.udid)
+            guard fileManager.fileExists(atPath: path) else {
+                return nil
+            }
+            return URL(fileURLWithPath: path)
+        }
+
+        guard !urls.isEmpty else {
+            handleError(SimulatorError.commandExecutionFailed("未找到该版本对应的模拟器目录"))
+            return
+        }
+
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
     
-    /// 为指定 Runtime 创建所有支持的模拟器设备
-    /// - Parameter runtime: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
-    func createDefaultDevices(for runtime: String) {
+    /// 模拟器批量创建模式
+    enum DeviceCreationMode {
+        case popular
+        case all
+    }
+
+    /// 为指定 Runtime 创建模拟器设备
+    /// - Parameters:
+    ///   - runtime: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+    ///   - mode: 创建设备范围
+    func createDevices(for runtime: String, mode: DeviceCreationMode) {
         isOperating = true
         
         // 获取当前已存在的设备名称
@@ -653,6 +694,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // 1. 获取该 runtime 支持的所有设备类型
             let supportedDeviceTypes = self?.getSupportedDeviceTypes(for: runtime) ?? []
+            let targetDeviceTypes = self?.filterDeviceTypes(
+                supportedDeviceTypes, for: mode) ?? []
             
             if supportedDeviceTypes.isEmpty {
                 print("未找到 runtime \(runtime) 支持的设备类型")
@@ -665,8 +708,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             
             var createdCount = 0
             
-            // 2. 创建所有支持的设备
-            for deviceType in supportedDeviceTypes {
+            // 2. 创建选中的设备
+            for deviceType in targetDeviceTypes {
                 // 跳过已存在的设备
                 if existingDeviceNames.contains(deviceType.name) {
                     continue
@@ -733,21 +776,144 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                         }
                     }
                     
-                    // 按设备类型排序：iPhone 在前，iPad 在后
-                    deviceTypes.sort { dt1, dt2 in
-                        if dt1.productFamily != dt2.productFamily {
-                            return dt1.productFamily == "iPhone"
-                        }
-                        return dt1.name < dt2.name
-                    }
-                    
-                    return deviceTypes
+                    let iPhones = deviceTypes.filter { $0.productFamily == "iPhone" }
+                    let iPads = deviceTypes.filter { $0.productFamily == "iPad" }
+                    return iPhones + iPads
                 }
             }
         } catch {
             print("获取支持的设备类型失败: \(error.localizedDescription)")
         }
         return []
+    }
+
+    private func filterDeviceTypes(
+        _ deviceTypes: [SupportedDeviceType], for mode: DeviceCreationMode
+    ) -> [SupportedDeviceType] {
+        switch mode {
+        case .all:
+            return deviceTypes
+        case .popular:
+            return getPopularDeviceTypes(from: deviceTypes)
+        }
+    }
+
+    private func getPopularDeviceTypes(
+        from deviceTypes: [SupportedDeviceType]
+    ) -> [SupportedDeviceType] {
+        var selected: [SupportedDeviceType] = []
+        var selectedIdentifiers = Set<String>()
+
+        func appendFirstMatch(
+            preferNonCapacityVariant: Bool = false,
+            where predicate: (SupportedDeviceType) -> Bool
+        ) {
+            let primaryCandidates = deviceTypes.filter {
+                predicate($0)
+                    && !selectedIdentifiers.contains($0.identifier)
+                    && (!preferNonCapacityVariant || !isCapacityVariant($0.name))
+            }
+
+            if let match = primaryCandidates.first {
+                selected.append(match)
+                selectedIdentifiers.insert(match.identifier)
+                return
+            }
+
+            if let fallback = deviceTypes.first(where: {
+                predicate($0) && !selectedIdentifiers.contains($0.identifier)
+            }) {
+                selected.append(fallback)
+                selectedIdentifiers.insert(fallback.identifier)
+            }
+        }
+
+        func appendLatestSE() {
+            let candidates = deviceTypes.filter {
+                $0.productFamily == "iPhone"
+                    && $0.name.contains("SE")
+                    && !selectedIdentifiers.contains($0.identifier)
+            }
+            let sortedCandidates = candidates.sorted {
+                seGeneration(of: $0.name) > seGeneration(of: $1.name)
+            }
+
+            if let match = sortedCandidates.first {
+                selected.append(match)
+                selectedIdentifiers.insert(match.identifier)
+            }
+        }
+
+        appendFirstMatch { $0.productFamily == "iPhone" && isStandardIPhone($0.name) }
+        appendFirstMatch { $0.productFamily == "iPhone" && $0.name.contains("Pro Max") }
+        appendFirstMatch {
+            $0.productFamily == "iPhone"
+                && $0.name.contains("Pro")
+                && !$0.name.contains("Max")
+        }
+        appendLatestSE()
+        appendFirstMatch { $0.productFamily == "iPhone" && isAlternativeIPhone($0.name) }
+        appendFirstMatch(preferNonCapacityVariant: true) {
+            $0.productFamily == "iPad" && $0.name.contains("iPad Pro")
+        }
+        appendFirstMatch(preferNonCapacityVariant: true) {
+            $0.productFamily == "iPad"
+                && ($0.name.contains("iPad Air") || isStandardIPad($0.name))
+        }
+
+        if selected.isEmpty {
+            return Array(deviceTypes.prefix(6))
+        }
+
+        return selected
+    }
+
+    private func isStandardIPhone(_ name: String) -> Bool {
+        guard name.hasPrefix("iPhone ") else { return false }
+        return !name.contains("Pro")
+            && !name.contains("Plus")
+            && !name.contains("mini")
+            && !name.contains("SE")
+            && !name.contains("Air")
+            && !matchesPattern("^iPhone \\d+e$", in: name)
+    }
+
+    private func isAlternativeIPhone(_ name: String) -> Bool {
+        name.contains("Plus")
+            || name.contains("mini")
+            || name.contains("SE")
+            || name.contains("Air")
+            || matchesPattern("^iPhone \\d+e$", in: name)
+    }
+
+    private func isStandardIPad(_ name: String) -> Bool {
+        name.hasPrefix("iPad ")
+            && !name.contains("Pro")
+            && !name.contains("Air")
+            && !name.contains("mini")
+    }
+
+    private func isCapacityVariant(_ name: String) -> Bool {
+        name.contains("(16GB)") || name.contains("(8GB)")
+    }
+
+    private func matchesPattern(_ pattern: String, in text: String) -> Bool {
+        text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private func seGeneration(of name: String) -> Int {
+        let pattern = #"iPhone SE \((\d+)(?:st|nd|rd|th) generation\)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return 0
+        }
+
+        let range = NSRange(name.startIndex..., in: name)
+        guard let match = regex.firstMatch(in: name, options: [], range: range),
+              let generationRange = Range(match.range(at: 1), in: name) else {
+            return 0
+        }
+
+        return Int(name[generationRange]) ?? 0
     }
     
     /// 支持的设备类型结构

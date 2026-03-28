@@ -176,7 +176,9 @@ struct ContentView: View {
     @StateObject private var simulatorManager = SimulatorManager()
     @State private var showingToast = false
     @State private var toastMessage = ""
+    @State private var showingCreateOptions = false
     @State private var showingDeleteConfirm = false
+    @State private var runtimeToCreate: SimulatorManager.DeviceGroup? = nil
     @State private var runtimeToDelete: SimulatorManager.DeviceGroup? = nil
 
     var body: some View {
@@ -200,20 +202,31 @@ struct ContentView: View {
                                 Text(group.displayName)
                                     .font(.headline)
                                 Spacer()
+                                Button(action: {
+                                    simulatorManager.showSimulatorsInFinder(for: group.runtime)
+                                }) {
+                                    Image(systemName: "folder")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(group.devices.isEmpty)
+                                .help(
+                                    group.devices.isEmpty
+                                        ? "当前版本还没有模拟器目录"
+                                        : "Show simulators in Finder")
+
                                 // 创建模拟器按钮
                                 Button(action: {
-                                    simulatorManager.createDefaultDevices(for: group.runtime)
-                                    toastMessage = "正在创建 \(group.displayName) 模拟器..."
-                                    withAnimation {
-                                        showingToast = true
-                                    }
+                                    runtimeToCreate = group
+                                    showingCreateOptions = true
                                 }) {
                                     Image(systemName: "plus.circle")
                                         .font(.caption)
                                         .foregroundColor(.green.opacity(0.8))
                                 }
                                 .buttonStyle(.plain)
-                                .help("创建该版本的常用模拟器")
+                                .help("选择要创建的模拟器范围")
                                 
                                 // 删除按钮
                                 Button(action: {
@@ -286,6 +299,37 @@ struct ContentView: View {
             }
         }
         .frame(width: 650, height: 500)  // 增加宽度以容纳更多内容
+        .confirmationDialog(
+            "添加 \(runtimeToCreate?.displayName ?? "") 模拟器",
+            isPresented: $showingCreateOptions,
+            titleVisibility: .visible
+        ) {
+            Button("添加主流机型") {
+                if let group = runtimeToCreate {
+                    simulatorManager.createDevices(for: group.runtime, mode: .popular)
+                    toastMessage = "正在为 \(group.displayName) 添加主流模拟器..."
+                    withAnimation {
+                        showingToast = true
+                    }
+                }
+                runtimeToCreate = nil
+            }
+            Button("添加全部支持设备") {
+                if let group = runtimeToCreate {
+                    simulatorManager.createDevices(for: group.runtime, mode: .all)
+                    toastMessage = "正在为 \(group.displayName) 添加全部支持设备..."
+                    withAnimation {
+                        showingToast = true
+                    }
+                }
+                runtimeToCreate = nil
+            }
+            Button("取消", role: .cancel) {
+                runtimeToCreate = nil
+            }
+        } message: {
+            Text("你可以只添加常用主流机型，或一次性添加该版本支持的全部 iPhone / iPad 模拟器。")
+        }
         .confirmationDialog(
             "删除 \(runtimeToDelete?.displayName ?? "") 版本",
             isPresented: $showingDeleteConfirm,
