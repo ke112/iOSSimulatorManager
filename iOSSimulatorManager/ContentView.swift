@@ -129,6 +129,23 @@ struct EmptyStateView: View {
     }
 }
 
+struct EmptyRuntimeGroupView: View {
+    let runtimeName: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("已安装 \(runtimeName) Runtime，但当前还没有模拟器设备。")
+                .font(.subheadline)
+                .foregroundColor(.primary)
+
+            Text("点击右上角 + 可为该版本创建常用模拟器。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 8)
+    }
+}
+
 // 简单的吐司通知视图
 struct ToastView: View {
     let message: String
@@ -211,16 +228,20 @@ struct ContentView: View {
                                 .help("删除该版本的所有模拟器")
                             }
                         ) {
-                            ForEach(group.devices) { device in
-                                DeviceRow(
-                                    device: device,
-                                    simulatorManager: simulatorManager,
-                                    showToast: { message in
-                                        toastMessage = message
-                                        withAnimation {
-                                            showingToast = true
-                                        }
-                                    })
+                            if group.devices.isEmpty {
+                                EmptyRuntimeGroupView(runtimeName: group.displayName)
+                            } else {
+                                ForEach(group.devices) { device in
+                                    DeviceRow(
+                                        device: device,
+                                        simulatorManager: simulatorManager,
+                                        showToast: { message in
+                                            toastMessage = message
+                                            withAnimation {
+                                                showingToast = true
+                                            }
+                                        })
+                                }
                             }
                         }
                     }
