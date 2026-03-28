@@ -197,10 +197,26 @@ struct ContentView: View {
                 // 设备列表
                 List {
                     ForEach(simulatorManager.deviceGroups) { group in
+                        let isDeletingRuntime = simulatorManager.deletingRuntimeIdentifier == group.runtime
+                        let deleteProgressText =
+                            simulatorManager.deletingRuntimeIncludesRuntime
+                            ? "正在彻底删除..."
+                            : "正在删除模拟器..."
+
                         Section(header: 
                             HStack {
                                 Text(group.displayName)
                                     .font(.headline)
+
+                                if isDeletingRuntime {
+                                    ProgressView()
+                                        .controlSize(.small)
+
+                                    Text(deleteProgressText)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
                                 Spacer()
                                 Button(action: {
                                     simulatorManager.showSimulatorsInFinder(for: group.runtime)
@@ -210,9 +226,11 @@ struct ContentView: View {
                                         .foregroundColor(.secondary)
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(group.devices.isEmpty)
+                                .disabled(group.devices.isEmpty || isDeletingRuntime)
                                 .help(
-                                    group.devices.isEmpty
+                                    isDeletingRuntime
+                                        ? deleteProgressText
+                                        : group.devices.isEmpty
                                         ? "当前版本还没有模拟器目录"
                                         : "Show simulators in Finder")
 
@@ -226,7 +244,8 @@ struct ContentView: View {
                                         .foregroundColor(.green.opacity(0.8))
                                 }
                                 .buttonStyle(.plain)
-                                .help("选择要创建的模拟器范围")
+                                .disabled(isDeletingRuntime)
+                                .help(isDeletingRuntime ? deleteProgressText : "选择要创建的模拟器范围")
                                 
                                 // 删除按钮
                                 Button(action: {
@@ -238,7 +257,8 @@ struct ContentView: View {
                                         .foregroundColor(.red.opacity(0.8))
                                 }
                                 .buttonStyle(.plain)
-                                .help("删除该版本的所有模拟器")
+                                .disabled(isDeletingRuntime)
+                                .help(isDeletingRuntime ? deleteProgressText : "删除该版本的所有模拟器")
                             }
                         ) {
                             if group.devices.isEmpty {
@@ -337,8 +357,17 @@ struct ContentView: View {
         ) {
             Button("仅删除模拟器设备", role: .destructive) {
                 if let group = runtimeToDelete {
-                    simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: false)
-                    toastMessage = "已删除 \(group.displayName) 的 \(group.devices.count) 个模拟器"
+                    simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: false) {
+                        success in
+                        toastMessage =
+                            success
+                            ? "已删除 \(group.displayName) 的 \(group.devices.count) 个模拟器"
+                            : "删除 \(group.displayName) 时出现问题"
+                        withAnimation {
+                            showingToast = true
+                        }
+                    }
+                    toastMessage = "正在删除 \(group.displayName) 的 \(group.devices.count) 个模拟器..."
                     withAnimation {
                         showingToast = true
                     }
@@ -347,8 +376,17 @@ struct ContentView: View {
             }
             Button("彻底删除（含 Runtime 镜像）", role: .destructive) {
                 if let group = runtimeToDelete {
-                    simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: true)
-                    toastMessage = "已彻底删除 \(group.displayName) 及其 Runtime"
+                    simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: true) {
+                        success in
+                        toastMessage =
+                            success
+                            ? "已彻底删除 \(group.displayName) 及其 Runtime"
+                            : "彻底删除 \(group.displayName) 时出现问题"
+                        withAnimation {
+                            showingToast = true
+                        }
+                    }
+                    toastMessage = "正在彻底删除 \(group.displayName) 及其 Runtime..."
                     withAnimation {
                         showingToast = true
                     }

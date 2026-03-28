@@ -25,6 +25,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     // 错误处理
     @Published var lastError: String? = nil
     @Published var hasError: Bool = false
+    @Published var deletingRuntimeIdentifier: String? = nil
+    @Published var deletingRuntimeIncludesRuntime: Bool = false
 
     /// 设备分组模型
     struct DeviceGroup: Identifiable {
@@ -472,15 +474,18 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     }
 
     /// 执行xc命令
-    private func executeSimctlCommand(arguments: [String]) {
+    @discardableResult
+    private func executeSimctlCommand(arguments: [String]) -> Bool {
         do {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
             process.arguments = ["simctl"] + arguments
             try process.run()
             process.waitUntilExit()
+            return process.terminationStatus == 0
         } catch {
             handleError(SimulatorError.commandExecutionFailed("命令执行失败: \(error.localizedDescription)"))
+            return false
         }
     }
 
@@ -541,28 +546,43 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     /// - Parameters:
     ///   - runtime: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
     ///   - deleteRuntime: 是否同时删除 iOS Runtime 镜像（彻底删除）
-    func deleteDevicesForRuntime(_ runtime: String, deleteRuntime: Bool = false) {
+    func deleteDevicesForRuntime(
+        _ runtime: String,
+        deleteRuntime: Bool = false,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         isOperating = true
+        deletingRuntimeIdentifier = runtime
+        deletingRuntimeIncludesRuntime = deleteRuntime
         
         // 获取该 runtime 下的所有设备
         guard let group = deviceGroups.first(where: { $0.runtime == runtime }) else {
             isOperating = false
+            deletingRuntimeIdentifier = nil
+            deletingRuntimeIncludesRuntime = false
+            completion?(false)
             return
         }
         
         // 在后台线程执行删除操作
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var deletionSucceeded = true
+
             // 1. 先删除所有模拟器设备
             for device in group.devices {
                 // 如果设备正在运行，先关闭
                 if device.state == "Booted" {
-                    self?.executeSimctlCommand(arguments: ["shutdown", device.udid])
+                    if self?.executeSimctlCommand(arguments: ["shutdown", device.udid]) == false {
+                        deletionSucceeded = false
+                    }
                     // 等待关闭完成
                     Thread.sleep(forTimeInterval: 0.5)
                 }
                 
                 // 删除设备
-                self?.executeSimctlCommand(arguments: ["delete", device.udid])
+                if self?.executeSimctlCommand(arguments: ["delete", device.udid]) == false {
+                    deletionSucceeded = false
+                }
             }
             
             // 2. 如果需要，删除 Runtime 镜像
@@ -572,14 +592,21 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 
                 // 获取 Runtime UUID 并删除
                 if let runtimeUUID = self?.getRuntimeUUID(for: runtime) {
-                    self?.deleteRuntimeWithPrivileges(uuid: runtimeUUID)
+                    if self?.deleteRuntimeWithPrivileges(uuid: runtimeUUID) == false {
+                        deletionSucceeded = false
+                    }
+                } else {
+                    deletionSucceeded = false
                 }
             }
             
             // 完成后刷新设备列表
             DispatchQueue.main.async {
                 self?.isOperating = false
+                self?.deletingRuntimeIdentifier = nil
+                self?.deletingRuntimeIncludesRuntime = false
                 self?.forceRefresh()
+                completion?(deletionSucceeded)
             }
         }
     }
@@ -619,7 +646,7 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     
     /// 使用管理员权限删除 Runtime
     /// - Parameter uuid: Runtime 的 UUID
-    private func deleteRuntimeWithPrivileges(uuid: String) {
+    private func deleteRuntimeWithPrivileges(uuid: String) -> Bool {
         // 使用 AppleScript 请求管理员权限执行删除命令
         let script = """
         do shell script "xcrun simctl runtime delete \(uuid)" with administrator privileges
@@ -634,10 +661,13 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 DispatchQueue.main.async {
                     self.handleError(SimulatorError.commandExecutionFailed("删除 Runtime 失败，可能需要手动执行: sudo xcrun simctl runtime delete \(uuid)"))
                 }
+                return false
             } else {
                 print("Runtime \(uuid) 删除成功")
+                return true
             }
         }
+        return false
     }
 
     /// 在 Finder 中显示当前 Runtime 下的模拟器设备目录
