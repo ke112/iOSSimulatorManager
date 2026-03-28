@@ -14,7 +14,7 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     @Published var hasInitialLoadCompleted: Bool = false
 
     private var timer: Timer?
-    private var isOperating = false
+    @Published private(set) var isOperating = false
     private var refreshTask: DispatchWorkItem?
     private var deviceCache: [SimulatorDevice] = []
     private var runtimeCache: Set<String> = []  // 已安装 Runtime 缓存
@@ -27,6 +27,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     @Published var hasError: Bool = false
     @Published var deletingRuntimeIdentifier: String? = nil
     @Published var deletingRuntimeIncludesRuntime: Bool = false
+    @Published var operatingDeviceUDID: String? = nil
+    @Published var operatingDeviceAction: DeviceOperationKind? = nil
 
     /// 设备分组模型
     struct DeviceGroup: Identifiable {
@@ -34,6 +36,26 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         let runtime: String
         let displayName: String
         var devices: [SimulatorDevice]
+    }
+
+    enum DeviceOperationKind {
+        case booting
+        case shuttingDown
+        case resetting
+        case deleting
+
+        var progressText: String {
+            switch self {
+            case .booting:
+                return "正在启动..."
+            case .shuttingDown:
+                return "正在关闭..."
+            case .resetting:
+                return "正在重置..."
+            case .deleting:
+                return "正在删除..."
+            }
+        }
     }
 
     init() {
@@ -397,6 +419,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     /// 开启设备
     func bootDevice(udid: String) {
         isOperating = true
+        operatingDeviceUDID = udid
+        operatingDeviceAction = .booting
 
         // 立即更新本地状态
         updateDeviceState(udid: udid, to: "Booted")
@@ -409,12 +433,16 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             self.openSimulatorApp()
             self.refreshDevices()
             self.isOperating = false
+            self.operatingDeviceUDID = nil
+            self.operatingDeviceAction = nil
         }
     }
 
     /// 关闭设备
     func shutdownDevice(udid: String) {
         isOperating = true
+        operatingDeviceUDID = udid
+        operatingDeviceAction = .shuttingDown
 
         // 立即更新本地状态
         updateDeviceState(udid: udid, to: "Shutdown")
@@ -426,6 +454,74 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
             self.refreshDevices()
             self.isOperating = false
+            self.operatingDeviceUDID = nil
+            self.operatingDeviceAction = nil
+        }
+    }
+
+    func eraseDevice(
+        udid: String,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        isOperating = true
+        operatingDeviceUDID = udid
+        operatingDeviceAction = .resetting
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let currentState = self?.devices.first(where: { $0.udid == udid })?.state
+            var succeeded = true
+
+            if currentState == "Booted" {
+                if self?.executeSimctlCommand(arguments: ["shutdown", udid]) == false {
+                    succeeded = false
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+
+            if self?.executeSimctlCommand(arguments: ["erase", udid]) == false {
+                succeeded = false
+            }
+
+            DispatchQueue.main.async {
+                self?.isOperating = false
+                self?.operatingDeviceUDID = nil
+                self?.operatingDeviceAction = nil
+                self?.forceRefresh()
+                completion?(succeeded)
+            }
+        }
+    }
+
+    func deleteDevice(
+        udid: String,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        isOperating = true
+        operatingDeviceUDID = udid
+        operatingDeviceAction = .deleting
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let currentState = self?.devices.first(where: { $0.udid == udid })?.state
+            var succeeded = true
+
+            if currentState == "Booted" {
+                if self?.executeSimctlCommand(arguments: ["shutdown", udid]) == false {
+                    succeeded = false
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+
+            if self?.executeSimctlCommand(arguments: ["delete", udid]) == false {
+                succeeded = false
+            }
+
+            DispatchQueue.main.async {
+                self?.isOperating = false
+                self?.operatingDeviceUDID = nil
+                self?.operatingDeviceAction = nil
+                self?.forceRefresh()
+                completion?(succeeded)
+            }
         }
     }
 

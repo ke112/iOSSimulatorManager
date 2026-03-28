@@ -409,9 +409,15 @@ struct DeviceRow: View {
     let device: SimulatorDevice
     let simulatorManager: SimulatorManager
     let showToast: (String) -> Void
+    @State private var showingResetConfirm = false
+    @State private var showingDeleteConfirm = false
 
     var body: some View {
         let backColor = Color.clear
+        let isDeviceOperating = simulatorManager.operatingDeviceUDID == device.udid
+        let isRuntimeDeleting = simulatorManager.deletingRuntimeIdentifier == device.runtime
+        let isActionDisabled = simulatorManager.isOperating || isRuntimeDeleting
+
         HStack(spacing: 12) {
             // 左侧设备信息
             VStack(alignment: .leading, spacing: 4) {
@@ -482,6 +488,37 @@ struct DeviceRow: View {
 
             Spacer(minLength: 20)  // 确保总是有足够的空间给开关
 
+            if isDeviceOperating, let action = simulatorManager.operatingDeviceAction {
+                ProgressView()
+                    .controlSize(.small)
+
+                Text(action.progressText)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Button(action: {
+                showingResetConfirm = true
+            }) {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.caption)
+                    .foregroundColor(.orange.opacity(0.9))
+            }
+            .buttonStyle(.plain)
+            .disabled(isActionDisabled)
+            .help(isActionDisabled ? "当前有操作正在执行" : "重置当前模拟器")
+
+            Button(action: {
+                showingDeleteConfirm = true
+            }) {
+                Image(systemName: "trash")
+                    .font(.caption)
+                    .foregroundColor(.red.opacity(0.8))
+            }
+            .buttonStyle(.plain)
+            .disabled(isActionDisabled)
+            .help(isActionDisabled ? "当前有操作正在执行" : "删除当前模拟器")
+
             // 右侧开关
             Toggle(
                 "",
@@ -498,8 +535,39 @@ struct DeviceRow: View {
             )
             .toggleStyle(.switch)
             .fixedSize()  // 确保开关不会被压缩
+            .disabled(isActionDisabled)
         }
         .padding(.vertical, 4)
+        .confirmationDialog(
+            "重置 \(device.name)",
+            isPresented: $showingResetConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("重置当前模拟器", role: .destructive) {
+                simulatorManager.eraseDevice(udid: device.udid) { success in
+                    showToast(success ? "已重置 \(device.name)" : "重置 \(device.name) 时出现问题")
+                }
+                showToast("正在重置 \(device.name)...")
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("会抹掉这台模拟器里的应用和数据，但保留这台模拟器本身。")
+        }
+        .confirmationDialog(
+            "删除 \(device.name)",
+            isPresented: $showingDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("删除当前模拟器", role: .destructive) {
+                simulatorManager.deleteDevice(udid: device.udid) { success in
+                    showToast(success ? "已删除 \(device.name)" : "删除 \(device.name) 时出现问题")
+                }
+                showToast("正在删除 \(device.name)...")
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("会删除这台模拟器及其数据，但不会删除所属的 Runtime。")
+        }
     }
 
     // 复制设备信息到剪贴板
