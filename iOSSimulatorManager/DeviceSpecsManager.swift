@@ -24,6 +24,7 @@ class DeviceSpecsManager {
   static let shared = DeviceSpecsManager()
   private var deviceSpecs: [String: DeviceSpec] = [:]
   private var deviceSpecsByIdentifier: [String: DeviceSpec] = [:]
+  private var normalizedDeviceSpecs: [String: DeviceSpec] = [:]
 
   private init() {
     loadAllSpecs()
@@ -38,12 +39,17 @@ class DeviceSpecsManager {
       return spec
     }
 
+    let normalizedName = normalizeDeviceName(deviceName)
+    if let spec = normalizedDeviceSpecs[normalizedName] {
+      return spec
+    }
+
     // 模糊匹配 - 从最具体到最通用
-    let sortedKeys = deviceSpecs.keys.sorted { $0.count > $1.count }
+    let sortedKeys = normalizedDeviceSpecs.keys.sorted { $0.count > $1.count }
 
     for key in sortedKeys {
-      if deviceName.contains(key) {
-        return deviceSpecs[key]
+      if normalizedName.contains(key) || key.contains(normalizedName) {
+        return normalizedDeviceSpecs[key]
       }
     }
 
@@ -63,7 +69,7 @@ class DeviceSpecsManager {
     return deviceSpecs
   }
 
-  /// 刷新动态规格（重新扫描 devicetypes 并合并 JSON 兜底）
+  /// 刷新动态规格（重新扫描 devicetypes 并更新本地缓存）
   func refreshDynamicSpecs() {
     loadAllSpecs()
   }
@@ -71,28 +77,48 @@ class DeviceSpecsManager {
   // MARK: - Loaders
 
   private func loadAllSpecs() {
-    let jsonSpecs = loadDeviceSpecsFromJSON()
+    let cachedSpecs = loadCachedDeviceSpecs()
     let dynamic = buildDynamicSpecs()
 
-    // 合并：动态优先，JSON 兜底
-    var merged: [String: DeviceSpec] = jsonSpecs
+    // 合并优先级：动态 > 本地缓存
+    var merged: [String: DeviceSpec] = cachedSpecs
     for (name, spec) in dynamic.byName {
       merged[name] = spec
     }
+
+    if !dynamic.byName.isEmpty {
+      saveCachedDeviceSpecs(dynamic.byName)
+    }
+
     self.deviceSpecs = merged
+    self.normalizedDeviceSpecs = buildNormalizedSpecs(from: merged)
     self.deviceSpecsByIdentifier = dynamic.byIdentifier
   }
 
-  private func loadDeviceSpecsFromJSON() -> [String: DeviceSpec] {
-    guard let url = Bundle.main.url(forResource: "DeviceSpecs", withExtension: "json"),
-      let data = try? Data(contentsOf: url),
+  private func loadCachedDeviceSpecs() -> [String: DeviceSpec] {
+    guard let cacheURL = deviceSpecsCacheURL(),
+      let data = try? Data(contentsOf: cacheURL),
       let config = try? JSONDecoder().decode(DeviceSpecsConfig.self, from: data)
     else {
-      print(
-        "[DeviceSpecs] Failed to load DeviceSpecs.json; will rely on dynamic specs if available")
       return [:]
     }
     return config.devices
+  }
+
+  private func saveCachedDeviceSpecs(_ specs: [String: DeviceSpec]) {
+    guard let cacheURL = deviceSpecsCacheURL() else { return }
+
+    do {
+      let folderURL = cacheURL.deletingLastPathComponent()
+      try FileManager.default.createDirectory(
+        at: folderURL, withIntermediateDirectories: true, attributes: nil)
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try encoder.encode(DeviceSpecsConfig(devices: specs))
+      try data.write(to: cacheURL, options: .atomic)
+    } catch {
+      print("[DeviceSpecs] Failed to write cached specs: \(error)")
+    }
   }
 
   private func buildDynamicSpecs() -> (
@@ -251,6 +277,52 @@ class DeviceSpecsManager {
   }
 
   // MARK: - Helpers
+
+  private func deviceSpecsCacheURL() -> URL? {
+    do {
+      let appSupport = try FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true)
+      return appSupport
+        .appendingPathComponent("iOSSimulatorManager", isDirectory: true)
+        .appendingPathComponent("DeviceSpecsCache.json")
+    } catch {
+      print("[DeviceSpecs] Failed to resolve cache directory: \(error)")
+      return nil
+    }
+  }
+
+  private func normalizeDeviceName(_ name: String) -> String {
+    let withoutCapacity = name.replacingOccurrences(
+      of: #"\s*\((?:8|16)GB\)"#,
+      with: "",
+      options: .regularExpression)
+    let cleaned = withoutCapacity.replacingOccurrences(
+      of: #"[^a-zA-Z0-9]+"#,
+      with: " ",
+      options: .regularExpression)
+    return cleaned
+      .lowercased()
+      .split(separator: " ")
+      .joined(separator: " ")
+  }
+
+  private func buildNormalizedSpecs(
+    from specs: [String: DeviceSpec]
+  ) -> [String: DeviceSpec] {
+    var normalized: [String: DeviceSpec] = [:]
+
+    for key in specs.keys.sorted() {
+      let normalizedKey = normalizeDeviceName(key)
+      if normalized[normalizedKey] == nil, let spec = specs[key] {
+        normalized[normalizedKey] = spec
+      }
+    }
+
+    return normalized
+  }
 
   private func runProcessCaptureOutput(executable: String, arguments: [String]) -> Data? {
     let process = Process()
