@@ -25,6 +25,8 @@ class DeviceSpecsManager {
   private var deviceSpecs: [String: DeviceSpec] = [:]
   private var deviceSpecsByIdentifier: [String: DeviceSpec] = [:]
   private var normalizedDeviceSpecs: [String: DeviceSpec] = [:]
+  private var deviceTypeIdentifierCache: [String: String] = [:]
+  private let udidCacheLock = NSLock()
 
   private init() {
     loadAllSpecs()
@@ -58,7 +60,15 @@ class DeviceSpecsManager {
 
   /// 通过 UDID 查询（解析 CoreSimulator 设备类型标识符，再映射到动态规格）
   func getDeviceSpec(forUDID udid: String) -> DeviceSpec? {
-    guard let identifier = readDeviceTypeIdentifierFromUDID(udid) else { return nil }
+    guard let identifier = deviceTypeIdentifier(forUDID: udid) else { return nil }
+    if let spec = deviceSpecsByIdentifier[identifier] {
+      return spec
+    }
+    return nil
+  }
+
+  /// 通过设备类型标识符查询规格，避免重复读取 device.plist。
+  func getDeviceSpec(forIdentifier identifier: String) -> DeviceSpec? {
     if let spec = deviceSpecsByIdentifier[identifier] {
       return spec
     }
@@ -367,6 +377,25 @@ class DeviceSpecsManager {
       return idStr
     }
     return nil
+  }
+
+  private func deviceTypeIdentifier(forUDID udid: String) -> String? {
+    udidCacheLock.lock()
+    let cachedIdentifier = deviceTypeIdentifierCache[udid]
+    udidCacheLock.unlock()
+
+    if let cachedIdentifier {
+      return cachedIdentifier
+    }
+
+    guard let identifier = readDeviceTypeIdentifierFromUDID(udid) else {
+      return nil
+    }
+
+    udidCacheLock.lock()
+    deviceTypeIdentifierCache[udid] = identifier
+    udidCacheLock.unlock()
+    return identifier
   }
 
   // 旧位置的查询接口已上移到 Public 区域，避免重复

@@ -15,9 +15,11 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
     private var timer: Timer?
     @Published private(set) var isOperating = false
+    private var isRefreshing = false
     private var refreshTask: DispatchWorkItem?
     private var deviceCache: [SimulatorDevice] = []
     private var runtimeCache: Set<String> = []  // 已安装 Runtime 缓存
+    private var renderedSnapshot: [DeviceGroupSnapshot] = []
     private var lastRefreshTime: Date = Date.distantPast
     private let refreshInterval: TimeInterval = 5.0 // 增加到5秒
     private let cacheValidTime: TimeInterval = 2.0 // 缓存有效期2秒
@@ -36,6 +38,22 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         let runtime: String
         let displayName: String
         var devices: [SimulatorDevice]
+    }
+
+    private struct DeviceSnapshot: Equatable {
+        let udid: String
+        let name: String
+        let state: String
+        let runtime: String
+        let screenSize: Double
+        let resolution: String
+        let logicalResolution: String
+    }
+
+    private struct DeviceGroupSnapshot: Equatable {
+        let runtime: String
+        let displayName: String
+        let devices: [DeviceSnapshot]
     }
 
     enum DeviceOperationKind {
@@ -123,15 +141,18 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     
     /// 刷新设备列表
     func refreshDevices() {
-        guard !isOperating else { return }
+        guard !isOperating, !isRefreshing else { return }
+        isRefreshing = true
         
         PerformanceMonitor.shared.startOperation("refreshDevices")
         
         // 检查缓存是否有效
         let now = Date()
         if now.timeIntervalSince(lastRefreshTime) < cacheValidTime && !deviceCache.isEmpty {
-            PerformanceMonitor.shared.logDebug("使用缓存数据，跳过刷新")
+            PerformanceMonitor.shared.logDebug(
+                "refreshDevices: 命中缓存，未执行 simctl 查询，也未触发 UI reload")
             DispatchQueue.main.async {
+                self.isRefreshing = false
                 if !self.hasInitialLoadCompleted {
                     self.hasInitialLoadCompleted = true
                     self.isLoading = false
@@ -148,161 +169,66 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             }
         }
 
-        do {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            process.arguments = ["simctl", "list", "devices", "-j"]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
 
-            let pipe = Pipe()
-            process.standardOutput = pipe
+            do {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+                process.arguments = ["simctl", "list", "devices", "-j"]
 
-            try process.run()
-            process.waitUntilExit()
+                let pipe = Pipe()
+                process.standardOutput = pipe
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let decoder = JSONDecoder()
-            let result = try decoder.decode(SimctlListResponse.self, from: data)
-            
-            // 在后台线程获取已安装的 Runtime 列表（避免阻塞主线程）
-            let installedRuntimes = Set(self.getInstalledRuntimes())
+                try process.run()
+                process.waitUntilExit()
 
-            DispatchQueue.main.async {
-                // 创建所有设备的列表
-                var allDevices = result.devices.flatMap { key, value in
-                    value.map { device in
-                        SimulatorDevice(
-                            udid: device.udid,
-                            name: device.name,
-                            state: device.state,
-                            runtime: key
-                        )
-                    }
-                }
-                
-                // 检查数据是否有变化（设备或 Runtime），如果没有变化则不更新UI
-                let devicesChanged = self.hasDevicesChanged(newDevices: allDevices)
-                let runtimesChanged = installedRuntimes != self.runtimeCache
-                
-                if devicesChanged || runtimesChanged {
-                    // 数据有变化，执行更新
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let decoder = JSONDecoder()
+                let result = try decoder.decode(SimctlListResponse.self, from: data)
+                let installedRuntimes = Set(self.getInstalledRuntimes())
+                let allDevices = self.buildSortedDevices(from: result)
+                let nextGroups = self.buildSortedDeviceGroups(
+                    from: allDevices,
+                    installedRuntimes: installedRuntimes)
+                let nextSnapshot = self.makeSnapshot(from: nextGroups)
+
+                DispatchQueue.main.async {
+                    self.isRefreshing = false
                     self.runtimeCache = installedRuntimes
-
-                    // 按版本号排序所有设备
-                    allDevices.sort { (device1, device2) -> Bool in
-                        let version1 = self.extractVersionNumber(from: device1.runtime)
-                        let version2 = self.extractVersionNumber(from: device2.runtime)
-
-                        // 首先按版本号排序（高版本在前）
-                        if version1 != version2 {
-                            return version1 > version2
-                        }
-
-                        // 如果版本相同，按设备类型排序（iPhone在前）
-                        if device1.deviceType != device2.deviceType {
-                            if device1.deviceType == .iPhone && device2.deviceType == .iPad {
-                                return true
-                            }
-                            if device1.deviceType == .iPad && device2.deviceType == .iPhone {
-                                return false
-                            }
-                        }
-
-                        // 如果设备类型相同，按屏幕尺寸排序（大屏幕在前）
-                        if device1.screenSize != device2.screenSize {
-                            return device1.screenSize > device2.screenSize
-                        }
-
-                        // 最后按名称字母顺序排序
-                        return device1.name < device2.name
-                    }
-
-                    // 更新缓存和设备列表
                     self.deviceCache = allDevices
                     self.lastRefreshTime = Date()
-                    self.devices = allDevices
 
-                    // 按运行时版本分组设备
-                    var groups: [String: DeviceGroup] = [:]
-                    
-                    // 1. 首先为所有已安装的 Runtime 创建空的分组
-                    for runtime in installedRuntimes {
-                        let displayName = self.formatRuntimeName(runtime)
-                        groups[runtime] = DeviceGroup(
-                            runtime: runtime,
-                            displayName: displayName,
-                            devices: []
-                        )
+                    if nextSnapshot != self.renderedSnapshot {
+                        self.renderedSnapshot = nextSnapshot
+                        self.devices = allDevices
+                        self.deviceGroups = nextGroups
+                        PerformanceMonitor.shared.logInfo(
+                            "refreshDevices: 已执行刷新并触发 UI reload，分组 \(nextGroups.count) 个，设备 \(allDevices.count) 台")
+                    } else {
+                        PerformanceMonitor.shared.logDebug(
+                            "refreshDevices: 已执行 simctl 刷新，但最终渲染快照无变化，未触发 UI reload；分组 \(nextGroups.count) 个，设备 \(allDevices.count) 台")
                     }
 
-                    // 2. 将设备添加到对应的分组
-                    for device in allDevices {
-                        let runtimeKey = device.runtime
-                        let displayName = self.formatRuntimeName(runtimeKey)
-
-                        if groups[runtimeKey] == nil {
-                            groups[runtimeKey] = DeviceGroup(
-                                runtime: runtimeKey,
-                                displayName: displayName,
-                                devices: []
-                            )
-                        }
-
-                        groups[runtimeKey]?.devices.append(device)
+                    if !self.hasInitialLoadCompleted {
+                        self.hasInitialLoadCompleted = true
+                        self.isLoading = false
                     }
 
-                    // 对每个组内的设备进行排序
-                    for key in groups.keys {
-                        groups[key]?.devices.sort { (device1, device2) -> Bool in
-                            // 首先按设备类型排序（iPhone在前）
-                            if device1.deviceType != device2.deviceType {
-                                if device1.deviceType == .iPhone && device2.deviceType == .iPad {
-                                    return true
-                                }
-                                if device1.deviceType == .iPad && device2.deviceType == .iPhone {
-                                    return false
-                                }
-                            }
-
-                            // 同类设备按屏幕尺寸排序（大屏幕在前）
-                            if device1.screenSize != device2.screenSize {
-                                return device1.screenSize > device2.screenSize
-                            }
-
-                            // 最后按名称字母顺序排序
-                            return device1.name < device2.name
-                        }
-                    }
-
-                    // 将分组转换为数组并按版本号排序
-                    let sortedGroupKeys = groups.keys.sorted { key1, key2 in
-                        let version1 = self.extractVersionNumber(from: key1)
-                        let version2 = self.extractVersionNumber(from: key2)
-                        return version1 > version2
-                    }
-
-                    // 创建最终排序的分组数组
-                    self.deviceGroups = sortedGroupKeys.compactMap { groups[$0] }
+                    PerformanceMonitor.shared.endOperation("refreshDevices")
                 }
+            } catch {
+                PerformanceMonitor.shared.logError(error, operation: "refreshDevices")
+                self.handleError(SimulatorError.commandExecutionFailed(error.localizedDescription))
+                DispatchQueue.main.async {
+                    self.isRefreshing = false
+                    if !self.hasInitialLoadCompleted {
+                        self.hasInitialLoadCompleted = true
+                        self.isLoading = false
+                    }
 
-                // 完成初次加载
-                if !self.hasInitialLoadCompleted {
-                    self.hasInitialLoadCompleted = true
-                    self.isLoading = false
+                    PerformanceMonitor.shared.endOperation("refreshDevices")
                 }
-                
-                PerformanceMonitor.shared.endOperation("refreshDevices")
-            }
-        } catch {
-            PerformanceMonitor.shared.logError(error, operation: "refreshDevices")
-            handleError(SimulatorError.commandExecutionFailed(error.localizedDescription))
-            DispatchQueue.main.async {
-                // 即使出错也要结束loading状态
-                if !self.hasInitialLoadCompleted {
-                    self.hasInitialLoadCompleted = true
-                    self.isLoading = false
-                }
-                
-                PerformanceMonitor.shared.endOperation("refreshDevices")
             }
         }
     }
@@ -333,6 +259,116 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
         // 没有发现差异
         return false
+    }
+
+    private func buildSortedDevices(from result: SimctlListResponse) -> [SimulatorDevice] {
+        var allDevices = result.devices.flatMap { key, value in
+            value.map { device in
+                SimulatorDevice(
+                    udid: device.udid,
+                    name: device.name,
+                    state: device.state,
+                    runtime: key,
+                    deviceTypeIdentifier: device.deviceTypeIdentifier
+                )
+            }
+        }
+        sortDevices(&allDevices)
+        return allDevices
+    }
+
+    private func buildSortedDeviceGroups(
+        from devices: [SimulatorDevice],
+        installedRuntimes: Set<String>
+    ) -> [DeviceGroup] {
+        var groups: [String: DeviceGroup] = [:]
+
+        for runtime in installedRuntimes {
+            let displayName = formatRuntimeName(runtime)
+            groups[runtime] = DeviceGroup(
+                runtime: runtime,
+                displayName: displayName,
+                devices: []
+            )
+        }
+
+        for device in devices {
+            let runtimeKey = device.runtime
+            let displayName = formatRuntimeName(runtimeKey)
+
+            if groups[runtimeKey] == nil {
+                groups[runtimeKey] = DeviceGroup(
+                    runtime: runtimeKey,
+                    displayName: displayName,
+                    devices: []
+                )
+            }
+
+            groups[runtimeKey]?.devices.append(device)
+        }
+
+        for key in groups.keys {
+            groups[key]?.devices.sort { shouldSortDevice($0, before: $1) }
+        }
+
+        let sortedGroupKeys = groups.keys.sorted { key1, key2 in
+            let version1 = extractVersionNumber(from: key1)
+            let version2 = extractVersionNumber(from: key2)
+            return version1 > version2
+        }
+
+        return sortedGroupKeys.compactMap { groups[$0] }
+    }
+
+    private func sortDevices(_ devices: inout [SimulatorDevice]) {
+        devices.sort { shouldSortDevice($0, before: $1) }
+    }
+
+    private func shouldSortDevice(
+        _ device1: SimulatorDevice,
+        before device2: SimulatorDevice
+    ) -> Bool {
+        let version1 = extractVersionNumber(from: device1.runtime)
+        let version2 = extractVersionNumber(from: device2.runtime)
+
+        if version1 != version2 {
+            return version1 > version2
+        }
+
+        if device1.deviceType != device2.deviceType {
+            if device1.deviceType == .iPhone && device2.deviceType == .iPad {
+                return true
+            }
+            if device1.deviceType == .iPad && device2.deviceType == .iPhone {
+                return false
+            }
+        }
+
+        if device1.screenSize != device2.screenSize {
+            return device1.screenSize > device2.screenSize
+        }
+
+        return device1.name < device2.name
+    }
+
+    private func makeSnapshot(from groups: [DeviceGroup]) -> [DeviceGroupSnapshot] {
+        groups.map { group in
+            DeviceGroupSnapshot(
+                runtime: group.runtime,
+                displayName: group.displayName,
+                devices: group.devices.map { device in
+                    DeviceSnapshot(
+                        udid: device.udid,
+                        name: device.name,
+                        state: device.state,
+                        runtime: device.runtime,
+                        screenSize: device.screenSize,
+                        resolution: device.resolution,
+                        logicalResolution: device.logicalResolution
+                    )
+                }
+            )
+        }
     }
 
     /// 格式化运行时名称，便于显示
@@ -531,12 +567,7 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             // 更新原始设备列表
             self.devices = self.devices.map { device in
                 if device.udid == udid {
-                    return SimulatorDevice(
-                        udid: device.udid,
-                        name: device.name,
-                        state: newState,
-                        runtime: device.runtime
-                    )
+                    return SimulatorDevice(copying: device, state: newState)
                 }
                 return device
             }
@@ -546,11 +577,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 for j in 0..<self.deviceGroups[i].devices.count {
                     if self.deviceGroups[i].devices[j].udid == udid {
                         self.deviceGroups[i].devices[j] = SimulatorDevice(
-                            udid: self.deviceGroups[i].devices[j].udid,
-                            name: self.deviceGroups[i].devices[j].name,
-                            state: newState,
-                            runtime: self.deviceGroups[i].devices[j].runtime
-                        )
+                            copying: self.deviceGroups[i].devices[j],
+                            state: newState)
                     }
                 }
             }
@@ -1094,4 +1122,5 @@ struct DeviceInfo: Codable {
     let udid: String
     let name: String
     let state: String
+    let deviceTypeIdentifier: String?
 }

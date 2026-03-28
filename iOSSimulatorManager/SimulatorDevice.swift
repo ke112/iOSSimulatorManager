@@ -19,7 +19,13 @@ struct SimulatorDevice: Identifiable {
     case other
   }
 
-  init(udid: String, name: String, state: String, runtime: String) {
+  init(
+    udid: String,
+    name: String,
+    state: String,
+    runtime: String,
+    deviceTypeIdentifier: String? = nil
+  ) {
     id = udid
     self.udid = udid
     self.name = name
@@ -28,7 +34,8 @@ struct SimulatorDevice: Identifiable {
 
     // 使用配置管理器获取设备信息（优先通过 UDID 解析设备类型，其次按名称）
     if let spec =
-      (DeviceSpecsManager.shared.getDeviceSpec(forUDID: udid)
+      (deviceTypeIdentifier.flatMap { DeviceSpecsManager.shared.getDeviceSpec(forIdentifier: $0) }
+        ?? DeviceSpecsManager.shared.getDeviceSpec(forUDID: udid)
         ?? DeviceSpecsManager.shared.getDeviceSpec(for: name))
     {
       self.screenSize = spec.screenSize
@@ -57,5 +64,17 @@ struct SimulatorDevice: Identifiable {
       self.resolution = ""
       self.logicalResolution = ""
     }
+  }
+
+  init(copying device: SimulatorDevice, state: String) {
+    id = device.id
+    udid = device.udid
+    name = device.name
+    self.state = state
+    runtime = device.runtime
+    deviceType = device.deviceType
+    screenSize = device.screenSize
+    resolution = device.resolution
+    logicalResolution = device.logicalResolution
   }
 }
