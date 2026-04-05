@@ -12,6 +12,10 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     @Published var isLoading: Bool = true
     // 是否初次加载完成
     @Published var hasInitialLoadCompleted: Bool = false
+    // 连续刷新失败次数（用于兜底保护）
+    private var consecutiveFailures: Int = 0
+    // 是否暂停自动刷新（当连续失败过多时）
+    @Published private(set) var isAutoRefreshPaused: Bool = false
 
     private var timer: Timer?
     @Published private(set) var isOperating = false
@@ -23,7 +27,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     private var lastRefreshTime: Date = Date.distantPast
     private let refreshInterval: TimeInterval = 5.0 // 增加到5秒
     private let cacheValidTime: TimeInterval = 2.0 // 缓存有效期2秒
-    
+    private let maxConsecutiveFailures: Int = 3  // 连续失败阈值，超过后暂停自动刷新
+
     // 错误处理
     @Published var lastError: String? = nil
     @Published var hasError: Bool = false
@@ -98,25 +103,42 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         timer?.invalidate()
     }
 
-    /// 清理不可用的模拟器
+    /// 清理不可用的模拟器（带超时保护）
     private func cleanUnavailableDevices() {
+        let process = Process()
+        let pipe = Pipe()
+        let timeoutSeconds: Double = 5.0
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "delete", "unavailable"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var didTimeout = false
+
+        // 设置超时
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, process.isRunning else { return }
+            didTimeout = true
+            process.terminate()
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
         do {
-            let process = Process()
-            let pipe = Pipe()
-
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            process.arguments = ["simctl", "delete", "unavailable"]
-            process.standardOutput = pipe
-            process.standardError = pipe
-
             try process.run()
             process.waitUntilExit()
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                print("清理超时：清理命令执行超过\(Int(timeoutSeconds))秒")
+                return
+            }
 
             if process.terminationStatus == 0 {
                 print("清理完成：已删除不可用的模拟器")
             } else {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let error = String(data: data, encoding: .utf8) {
+                if let error = String(data: data, encoding: .utf8), !error.isEmpty {
                     print("清理失败：\(error)")
                 }
             }
@@ -125,27 +147,37 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         }
     }
 
-    /// 带防抖的刷新设备列表
+    /// 带防抖的刷新设备列表（定时器驱动）
     private func refreshDevicesWithDebounce() {
+        // 如果自动刷新已暂停，不执行自动刷新
+        guard !isAutoRefreshPaused else { return }
+
         // 取消之前的刷新任务
         refreshTask?.cancel()
-        
+
         // 创建新的刷新任务
         refreshTask = DispatchWorkItem { [weak self] in
             self?.refreshDevices()
         }
-        
+
         // 延迟执行，防抖
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: refreshTask!)
+    }
+
+    /// 手动刷新时重置失败计数并恢复自动刷新
+    func manualResumeAutoRefresh() {
+        consecutiveFailures = 0
+        isAutoRefreshPaused = false
+        refreshDevices()
     }
     
     /// 刷新设备列表
     func refreshDevices() {
         guard !isOperating, !isRefreshing else { return }
         isRefreshing = true
-        
+
         PerformanceMonitor.shared.startOperation("refreshDevices")
-        
+
         // 检查缓存是否有效
         let now = Date()
         if now.timeIntervalSince(lastRefreshTime) < cacheValidTime && !deviceCache.isEmpty {
@@ -153,6 +185,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 "refreshDevices: 命中缓存，未执行 simctl 查询，也未触发 UI reload")
             DispatchQueue.main.async {
                 self.isRefreshing = false
+                // 命中缓存时重置失败计数
+                self.consecutiveFailures = 0
                 if !self.hasInitialLoadCompleted {
                     self.hasInitialLoadCompleted = true
                     self.isLoading = false
@@ -172,65 +206,367 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
 
-            do {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-                process.arguments = ["simctl", "list", "devices", "-j"]
+            // 使用带超时的执行方式
+            let success = self.executeRefreshWithTimeout()
 
-                let pipe = Pipe()
-                process.standardOutput = pipe
+            DispatchQueue.main.async {
+                self.isRefreshing = false
 
-                try process.run()
-                process.waitUntilExit()
+                // 处理失败计数
+                if success {
+                    self.consecutiveFailures = 0
+                    // 成功后恢复自动刷新（如果之前因失败而暂停）
+                    if self.isAutoRefreshPaused {
+                        self.isAutoRefreshPaused = false
+                        PerformanceMonitor.shared.logInfo("检测到 CoreSimulator 恢复正常，已恢复自动刷新")
+                    }
+                } else {
+                    self.consecutiveFailures += 1
+                    PerformanceMonitor.shared.logDebug(
+                        "refreshDevices: 刷新失败，当前连续失败次数: \(self.consecutiveFailures)")
 
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let decoder = JSONDecoder()
-                let result = try decoder.decode(SimctlListResponse.self, from: data)
-                let installedRuntimes = Set(self.getInstalledRuntimes())
-                let allDevices = self.buildSortedDevices(from: result)
-                let nextGroups = self.buildSortedDeviceGroups(
-                    from: allDevices,
-                    installedRuntimes: installedRuntimes)
-                let nextSnapshot = self.makeSnapshot(from: nextGroups)
-
-                DispatchQueue.main.async {
-                    self.isRefreshing = false
-                    self.runtimeCache = installedRuntimes
-                    self.deviceCache = allDevices
-                    self.lastRefreshTime = Date()
-
-                    if nextSnapshot != self.renderedSnapshot {
-                        self.renderedSnapshot = nextSnapshot
-                        self.devices = allDevices
-                        self.deviceGroups = nextGroups
+                    // 连续失败超过阈值时暂停自动刷新
+                    if self.consecutiveFailures >= self.maxConsecutiveFailures && !self.isAutoRefreshPaused {
+                        self.isAutoRefreshPaused = true
                         PerformanceMonitor.shared.logInfo(
-                            "refreshDevices: 已执行刷新并触发 UI reload，分组 \(nextGroups.count) 个，设备 \(allDevices.count) 台")
-                    } else {
-                        PerformanceMonitor.shared.logDebug(
-                            "refreshDevices: 已执行 simctl 刷新，但最终渲染快照无变化，未触发 UI reload；分组 \(nextGroups.count) 个，设备 \(allDevices.count) 台")
+                            "连续失败次数超过 \(self.maxConsecutiveFailures) 次，已暂停自动刷新，请手动刷新或重启 Xcode")
+                        self.handleError(SimulatorError.commandExecutionFailed(
+                            "检测到 CoreSimulator 可能异常，已暂停自动刷新。请手动刷新或重启 Xcode 后再试。"))
                     }
-
-                    if !self.hasInitialLoadCompleted {
-                        self.hasInitialLoadCompleted = true
-                        self.isLoading = false
-                    }
-
-                    PerformanceMonitor.shared.endOperation("refreshDevices")
                 }
-            } catch {
-                PerformanceMonitor.shared.logError(error, operation: "refreshDevices")
-                self.handleError(SimulatorError.commandExecutionFailed(error.localizedDescription))
-                DispatchQueue.main.async {
-                    self.isRefreshing = false
-                    if !self.hasInitialLoadCompleted {
-                        self.hasInitialLoadCompleted = true
-                        self.isLoading = false
-                    }
 
-                    PerformanceMonitor.shared.endOperation("refreshDevices")
+                if !self.hasInitialLoadCompleted {
+                    self.hasInitialLoadCompleted = true
+                    self.isLoading = false
+                }
+                PerformanceMonitor.shared.endOperation("refreshDevices")
+            }
+        }
+    }
+
+    /// 带超时的刷新执行
+    /// 策略：优先使用 JSON 格式（快），超时后使用普通文本格式（兼容性好）
+    private func executeRefreshWithTimeout() -> Bool {
+        // 首先尝试 JSON 格式（更快、更结构化）
+        let (jsonSuccess, devicesFromJson) = tryRefreshWithJsonFormat(timeoutSeconds: 10.0)
+
+        var allDevices: [SimulatorDevice] = []
+        var installedRuntimes: Set<String> = []
+
+        if jsonSuccess, let devices = devicesFromJson {
+            allDevices = devices
+            installedRuntimes = Set(getInstalledRuntimes())
+            PerformanceMonitor.shared.logInfo("使用 JSON 格式刷新成功，获取到 \(allDevices.count) 台设备")
+        } else {
+            // JSON 格式失败，尝试普通文本格式作为备选
+            PerformanceMonitor.shared.logInfo("JSON 格式超时/失败，尝试使用普通文本格式作为备选...")
+            let (textSuccess, devicesFromText) = tryRefreshWithTextFormat(timeoutSeconds: 15.0)
+
+            if textSuccess, let devices = devicesFromText {
+                allDevices = devices
+                installedRuntimes = Set(getInstalledRuntimes())
+                PerformanceMonitor.shared.logInfo("使用文本格式刷新成功，获取到 \(allDevices.count) 台设备")
+            } else {
+                // 文本格式也失败，检查是否有缓存数据
+                if !deviceCache.isEmpty {
+                    PerformanceMonitor.shared.logInfo("刷新失败，保留缓存数据（\(deviceCache.count) 台设备）")
+                    // 更新 lastRefreshTime 避免立即重试
+                    DispatchQueue.main.async { [weak self] in
+                        self?.lastRefreshTime = Date()
+                    }
+                    // 不返回 false，避免触发失败计数增加
+                    return true
+                }
+                return false
+            }
+        }
+
+        // 记录 installedRuntimes 用于调试
+        PerformanceMonitor.shared.logDebug("文本解析后 installedRuntimes: \(installedRuntimes)")
+
+        let nextGroups = buildSortedDeviceGroups(from: allDevices, installedRuntimes: installedRuntimes)
+        PerformanceMonitor.shared.logDebug("文本解析后生成分组: \(nextGroups.count) 个")
+        for group in nextGroups {
+            PerformanceMonitor.shared.logDebug("  分组 '\(group.displayName)': \(group.devices.count) 台设备")
+        }
+
+        let nextSnapshot = makeSnapshot(from: nextGroups)
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.runtimeCache = installedRuntimes
+            self.deviceCache = allDevices
+            self.lastRefreshTime = Date()
+
+            if nextSnapshot != self.renderedSnapshot {
+                self.renderedSnapshot = nextSnapshot
+                self.devices = allDevices
+                self.deviceGroups = nextGroups
+                PerformanceMonitor.shared.logInfo(
+                    "refreshDevices: 已执行刷新并触发 UI reload，分组 \(nextGroups.count) 个，设备 \(allDevices.count) 台")
+            } else {
+                PerformanceMonitor.shared.logDebug(
+                    "refreshDevices: 已执行 simctl 刷新，但最终渲染快照无变化，未触发 UI reload")
+            }
+        }
+        return true
+    }
+
+    /// 使用 JSON 格式刷新设备列表
+    private func tryRefreshWithJsonFormat(timeoutSeconds: Double) -> (Bool, [SimulatorDevice]?) {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "list", "devices", "-j"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var didTimeout = false
+        var terminationOccurred = false
+
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, !terminationOccurred else { return }
+            didTimeout = true
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                PerformanceMonitor.shared.logDebug("JSON 格式刷新超时（\(Int(timeoutSeconds))秒）")
+                return (false, nil)
+            }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+            if data.isEmpty {
+                PerformanceMonitor.shared.logDebug("JSON 格式返回空数据")
+                return (false, nil)
+            }
+
+            let decoder = JSONDecoder()
+            let result = try decoder.decode(SimctlListResponse.self, from: data)
+            let allDevices = buildSortedDevices(from: result)
+            return (true, allDevices)
+        } catch {
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+            PerformanceMonitor.shared.logDebug("JSON 格式解析失败: \(error.localizedDescription)")
+            return (false, nil)
+        }
+    }
+
+    /// 使用普通文本格式刷新设备列表（备选方案，当 JSON 格式失败时使用）
+    private func tryRefreshWithTextFormat(timeoutSeconds: Double) -> (Bool, [SimulatorDevice]?) {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "list", "devices"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var didTimeout = false
+        var terminationOccurred = false
+
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, !terminationOccurred else { return }
+            didTimeout = true
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                PerformanceMonitor.shared.logDebug("文本格式刷新超时（\(Int(timeoutSeconds))秒）")
+                return (false, nil)
+            }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else {
+                PerformanceMonitor.shared.logDebug("文本格式返回空数据")
+                return (false, nil)
+            }
+
+            // 解析文本格式的设备列表
+            let allDevices = parseTextFormatDevices(output)
+            return (true, allDevices)
+        } catch {
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+            PerformanceMonitor.shared.logDebug("文本格式执行失败: \(error.localizedDescription)")
+            return (false, nil)
+        }
+    }
+
+    /// 解析普通文本格式的 simctl list devices 输出
+    private func parseTextFormatDevices(_ output: String) -> [SimulatorDevice] {
+        var devices: [SimulatorDevice] = []
+        var currentRuntime: String = ""
+
+        // 构建现有设备的查找表（名称+运行时 -> 设备），用于保留真实 UDID
+        var existingDevicesMap: [String: SimulatorDevice] = [:]
+        for device in deviceCache {
+            let key = "\(device.name)|\(device.runtime)"
+            existingDevicesMap[key] = device
+        }
+
+        let lines = output.components(separatedBy: "\n")
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // 检测 Runtime 分组头，如 "-- iOS 18.6 --"
+            if trimmed.hasPrefix("--") && trimmed.hasSuffix("--") {
+                currentRuntime = trimmed
+                    .replacingOccurrences(of: "--", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                // 转换为标准格式
+                let converted = convertToRuntimeIdentifier(currentRuntime)
+                PerformanceMonitor.shared.logDebug("文本解析: 发现 runtime header '\(currentRuntime)' -> '\(converted)'")
+                currentRuntime = converted
+                continue
+            }
+
+            // 跳过 "== Runtimes ==" 和 "== Devices ==" 等标题行
+            if trimmed.hasPrefix("==") && trimmed.hasSuffix("==") {
+                continue
+            }
+
+            // 检测设备行，如 "iPhone 16 Pro (UDID) (Shutdown)"
+            if trimmed.contains("(") && trimmed.contains(")") && !trimmed.hasPrefix("--") {
+                if currentRuntime.isEmpty {
+                    PerformanceMonitor.shared.logDebug("文本解析: 跳过设备行（无 runtime）: \(trimmed.prefix(50))")
+                    continue
+                }
+                if let device = parseTextDeviceLine(trimmed, runtime: currentRuntime, existingDevicesMap: existingDevicesMap) {
+                    devices.append(device)
                 }
             }
         }
+
+        PerformanceMonitor.shared.logDebug("文本解析: 共解析出 \(devices.count) 台设备")
+        return devices
+    }
+
+    /// 将文本格式的 runtime 名称转换为标识符格式
+    private func convertToRuntimeIdentifier(_ displayName: String) -> String {
+        // "iOS 18.3" -> "com.apple.CoreSimulator.SimRuntime.iOS-18-3"
+        if displayName.hasPrefix("iOS ") {
+            let version = displayName.replacingOccurrences(of: "iOS ", with: "")
+            let parts = version.components(separatedBy: ".")
+            if parts.count == 2 {
+                return "com.apple.CoreSimulator.SimRuntime.iOS-\(parts[0])-\(parts[1])"
+            } else if parts.count == 1 {
+                return "com.apple.CoreSimulator.SimRuntime.iOS-\(parts[0])-0"
+            }
+        }
+        return displayName
+    }
+
+    /// 解析单行设备信息
+    private func parseTextDeviceLine(_ line: String, runtime: String, existingDevicesMap: [String: SimulatorDevice]) -> SimulatorDevice? {
+        // 格式: "iPhone 16 Pro (UDID) (Shutdown)" 或 "iPhone SE (3rd generation) (UDID) (Booted)"
+        // 第二个括号是 UDID，最后一个括号是状态
+
+        // 找到倒数第二个和倒数第一个左括号（分别对应 UDID 和状态）
+        guard let lastOpenParen = line.lastIndex(of: "("),
+              let secondLastOpenParen = line[..<lastOpenParen].lastIndex(of: "("),
+              let lastCloseParen = line.lastIndex(of: ")") else {
+            return nil
+        }
+
+        // 提取 UDID
+        let udid = String(line[line.index(after: secondLastOpenParen)..<lastOpenParen])
+            .trimmingCharacters(in: .whitespaces)
+
+        // 提取状态
+        let stateStr = String(line[line.index(after: lastOpenParen)..<lastCloseParen])
+            .trimmingCharacters(in: .whitespaces)
+
+        // 提取名称（从行首到 UDID 左括号之前）
+        let name = String(line[..<secondLastOpenParen]).trimmingCharacters(in: .whitespaces)
+
+        // 确定设备状态
+        let state: String
+        if stateStr.contains("Booted") && !stateStr.contains("Shutting") {
+            state = "Booted"
+        } else if stateStr.contains("Shutting") {
+            state = "Shutting Down"
+        } else {
+            state = "Shutdown"
+        }
+
+        // 验证 UDID 格式是否有效（应该是类似 UUID 的格式）
+        let isValidUDID = udid.count == 36 && udid.contains("-")
+
+        if isValidUDID {
+            // 使用真实 UDID
+            return SimulatorDevice(
+                udid: udid,
+                name: name,
+                state: state,
+                runtime: runtime,
+                deviceTypeIdentifier: nil,
+                isPlaceholder: false  // 真实设备
+            )
+        }
+
+        // UDID 无效，尝试从缓存匹配
+        let lookupKey = "\(name)|\(runtime)"
+        if let existingDevice = existingDevicesMap[lookupKey] {
+            // 使用现有设备的 UDID，但更新状态
+            return SimulatorDevice(
+                udid: existingDevice.udid,
+                name: name,
+                state: state,
+                runtime: runtime,
+                deviceTypeIdentifier: nil,
+                isPlaceholder: false  // 真实设备
+            )
+        }
+
+        // 无法获取有效 UDID，生成伪 UDID（标记为占位设备）
+        let pseudoUDID = generatePseudoUDID(name: name, runtime: runtime)
+
+        return SimulatorDevice(
+            udid: pseudoUDID,
+            name: name,
+            state: state,
+            runtime: runtime,
+            deviceTypeIdentifier: nil,
+            isPlaceholder: true  // 占位设备
+        )
+    }
+
+    /// 为文本格式生成伪 UDID（因为文本格式不包含 UDID）
+    private func generatePseudoUDID(name: String, runtime: String) -> String {
+        let input = "\(name)-\(runtime)"
+        var hash: UInt64 = 5381
+        for char in input.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(char)
+        }
+
+        // 生成类似真实 UDID 的格式
+        let hex = String(hash, radix: 16).uppercased()
+        let padded = String(repeating: "0", count: max(0, 24 - hex.count)) + hex
+        return "\(padded.prefix(8))-\(padded.dropFirst(8).prefix(4))-\(padded.dropFirst(12).prefix(4))-\(padded.dropFirst(16).prefix(4))-\(padded.dropFirst(20))"
     }
 
     /// 检查设备列表是否有变化
@@ -413,27 +749,44 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         return 0.0
     }
     
-    /// 获取所有已安装的 iOS Runtime 标识符列表
+    /// 获取所有已安装的 iOS Runtime 标识符列表（带超时保护）
     /// - Returns: Runtime 标识符数组，如 ["com.apple.CoreSimulator.SimRuntime.iOS-17-5", ...]
     private func getInstalledRuntimes() -> [String] {
+        let process = Process()
+        let pipe = Pipe()
+        let timeoutSeconds: Double = 8.0
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "list", "runtimes", "-j"]
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        var didTimeout = false
+
+        // 设置超时
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, process.isRunning else { return }
+            didTimeout = true
+            process.terminate()
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
         do {
-            let process = Process()
-            let pipe = Pipe()
-            
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            process.arguments = ["simctl", "list", "runtimes", "-j"]
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            
             try process.run()
             process.waitUntilExit()
-            
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                print("获取 Runtime 超时：命令执行超过\(Int(timeoutSeconds))秒")
+                return []
+            }
+
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            
+
             // 解析 JSON
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let runtimes = json["runtimes"] as? [[String: Any]] {
-                
+
                 var runtimeIdentifiers: [String] = []
                 for runtimeInfo in runtimes {
                     // 只获取 iOS runtime，且为可用状态
@@ -454,6 +807,12 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
     /// 开启设备
     func bootDevice(udid: String) {
+        // 检查是否为占位设备（伪 UDID）
+        if let device = devices.first(where: { $0.udid == udid }), device.isPlaceholder {
+            handleError(SimulatorError.commandExecutionFailed("无法启动：该设备信息不完整，请刷新后重试"))
+            return
+        }
+
         isOperating = true
         operatingDeviceUDID = udid
         operatingDeviceAction = .booting
@@ -476,6 +835,12 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
     /// 关闭设备
     func shutdownDevice(udid: String) {
+        // 检查是否为占位设备（伪 UDID）
+        if let device = devices.first(where: { $0.udid == udid }), device.isPlaceholder {
+            handleError(SimulatorError.commandExecutionFailed("无法关闭：该设备信息不完整，请刷新后重试"))
+            return
+        }
+
         isOperating = true
         operatingDeviceUDID = udid
         operatingDeviceAction = .shuttingDown
@@ -499,6 +864,13 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         udid: String,
         completion: ((Bool) -> Void)? = nil
     ) {
+        // 检查是否为占位设备（伪 UDID）
+        if let device = devices.first(where: { $0.udid == udid }), device.isPlaceholder {
+            handleError(SimulatorError.commandExecutionFailed("无法重置：该设备信息不完整，请刷新后重试"))
+            completion?(false)
+            return
+        }
+
         isOperating = true
         operatingDeviceUDID = udid
         operatingDeviceAction = .resetting
@@ -532,6 +904,13 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         udid: String,
         completion: ((Bool) -> Void)? = nil
     ) {
+        // 检查是否为占位设备（伪 UDID）
+        if let device = devices.first(where: { $0.udid == udid }), device.isPlaceholder {
+            handleError(SimulatorError.commandExecutionFailed("无法删除：该设备信息不完整，请刷新后重试"))
+            completion?(false)
+            return
+        }
+
         isOperating = true
         operatingDeviceUDID = udid
         operatingDeviceAction = .deleting
@@ -597,17 +976,43 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         }
     }
 
-    /// 执行xc命令
+    /// 执行xc命令（带超时保护）
     @discardableResult
-    private func executeSimctlCommand(arguments: [String]) -> Bool {
+    private func executeSimctlCommand(arguments: [String], timeoutSeconds: Double = 30.0) -> Bool {
+        let process = Process()
+        let timeout: Double = timeoutSeconds
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl"] + arguments
+
+        var didTimeout = false
+        var terminationOccurred = false
+
+        // 设置超时
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, !terminationOccurred else { return }
+            didTimeout = true
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
+
         do {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-            process.arguments = ["simctl"] + arguments
             try process.run()
             process.waitUntilExit()
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                handleError(SimulatorError.commandExecutionFailed("命令执行超时（\(Int(timeout))秒）"))
+                return false
+            }
+
             return process.terminationStatus == 0
         } catch {
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
             handleError(SimulatorError.commandExecutionFailed("命令执行失败: \(error.localizedDescription)"))
             return false
         }
@@ -675,63 +1080,197 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         deleteRuntime: Bool = false,
         completion: ((Bool) -> Void)? = nil
     ) {
+        PerformanceMonitor.shared.logInfo("开始删除 runtime: \(runtime), deleteRuntime: \(deleteRuntime)")
+
         isOperating = true
         deletingRuntimeIdentifier = runtime
         deletingRuntimeIncludesRuntime = deleteRuntime
-        
-        // 获取该 runtime 下的所有设备
-        guard let group = deviceGroups.first(where: { $0.runtime == runtime }) else {
-            isOperating = false
-            deletingRuntimeIdentifier = nil
-            deletingRuntimeIncludesRuntime = false
-            completion?(false)
-            return
-        }
-        
+
         // 在后台线程执行删除操作
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
             var deletionSucceeded = true
 
-            // 1. 先删除所有模拟器设备
-            for device in group.devices {
+            // 1. 直接从系统获取该 runtime 下的所有真实设备（不依赖缓存）
+            let devicesToDelete = self.getDevicesForRuntime(runtime)
+
+            if devicesToDelete.isEmpty {
+                PerformanceMonitor.shared.logInfo("未找到 runtime \(runtime) 对应的任何设备")
+            } else {
+                PerformanceMonitor.shared.logInfo("找到 \(devicesToDelete.count) 台设备需要删除")
+            }
+
+            // 2. 删除所有设备
+            for device in devicesToDelete {
+                PerformanceMonitor.shared.logInfo("正在删除设备: \(device.name) (UDID: \(device.udid), State: \(device.state))")
+
                 // 如果设备正在运行，先关闭
                 if device.state == "Booted" {
-                    if self?.executeSimctlCommand(arguments: ["shutdown", device.udid]) == false {
-                        deletionSucceeded = false
+                    PerformanceMonitor.shared.logInfo("设备正在运行，先关闭: \(device.udid)")
+                    if self.executeSimctlCommand(arguments: ["shutdown", device.udid]) == false {
+                        PerformanceMonitor.shared.logInfo("关闭设备失败: \(device.udid)")
+                        // 关闭失败不标记 deletionSucceeded = false，继续尝试删除
                     }
                     // 等待关闭完成
                     Thread.sleep(forTimeInterval: 0.5)
                 }
-                
+
                 // 删除设备
-                if self?.executeSimctlCommand(arguments: ["delete", device.udid]) == false {
+                PerformanceMonitor.shared.logInfo("执行删除: \(device.udid)")
+                if self.executeSimctlCommand(arguments: ["delete", device.udid]) == false {
+                    PerformanceMonitor.shared.logInfo("删除设备失败: \(device.udid)")
                     deletionSucceeded = false
+                } else {
+                    PerformanceMonitor.shared.logInfo("删除设备成功: \(device.udid)")
                 }
             }
-            
-            // 2. 如果需要，删除 Runtime 镜像
+
+            // 3. 如果需要，删除 Runtime 镜像
             if deleteRuntime {
                 // 等待设备删除完成
                 Thread.sleep(forTimeInterval: 1.0)
-                
+
                 // 获取 Runtime UUID 并删除
-                if let runtimeUUID = self?.getRuntimeUUID(for: runtime) {
-                    if self?.deleteRuntimeWithPrivileges(uuid: runtimeUUID) == false {
+                if let runtimeUUID = self.getRuntimeUUID(for: runtime) {
+                    PerformanceMonitor.shared.logInfo("删除 Runtime UUID: \(runtimeUUID)")
+                    if self.deleteRuntimeWithPrivileges(uuid: runtimeUUID) == false {
                         deletionSucceeded = false
                     }
                 } else {
+                    PerformanceMonitor.shared.logInfo("获取 Runtime UUID 失败")
                     deletionSucceeded = false
                 }
             }
-            
+
+            PerformanceMonitor.shared.logInfo("删除操作完成，结果: \(deletionSucceeded)")
+
             // 完成后刷新设备列表
             DispatchQueue.main.async {
-                self?.isOperating = false
-                self?.deletingRuntimeIdentifier = nil
-                self?.deletingRuntimeIncludesRuntime = false
-                self?.forceRefresh()
+                self.isOperating = false
+                self.deletingRuntimeIdentifier = nil
+                self.deletingRuntimeIncludesRuntime = false
+                self.forceRefresh()
                 completion?(deletionSucceeded)
             }
+        }
+    }
+
+    /// 直接从系统获取指定 runtime 的所有设备（不依赖缓存）
+    private func getDevicesForRuntime(_ runtime: String) -> [SimulatorDevice] {
+        // 优先尝试 JSON 格式
+        if let devices = tryGetDevicesJsonFormat(timeoutSeconds: 8.0) {
+            return devices.filter { $0.runtime == runtime }
+        }
+
+        // JSON 失败，尝试文本格式
+        if let devices = tryGetDevicesTextFormat(timeoutSeconds: 10.0) {
+            return devices.filter { $0.runtime == runtime }
+        }
+
+        return []
+    }
+
+    /// 尝试用 JSON 格式获取设备列表
+    private func tryGetDevicesJsonFormat(timeoutSeconds: Double) -> [SimulatorDevice]? {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "list", "devices", "-j"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var didTimeout = false
+        var terminationOccurred = false
+
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, !terminationOccurred else { return }
+            didTimeout = true
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                PerformanceMonitor.shared.logDebug("getDevices: JSON 格式超时")
+                return nil
+            }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if data.isEmpty {
+                PerformanceMonitor.shared.logDebug("getDevices: JSON 格式返回空")
+                return nil
+            }
+
+            let decoder = JSONDecoder()
+            let result = try decoder.decode(SimctlListResponse.self, from: data)
+            return buildSortedDevices(from: result)
+        } catch {
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+            PerformanceMonitor.shared.logDebug("getDevices: JSON 格式失败 - \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// 尝试用文本格式获取设备列表
+    private func tryGetDevicesTextFormat(timeoutSeconds: Double) -> [SimulatorDevice]? {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "list", "devices"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var didTimeout = false
+        var terminationOccurred = false
+
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, !terminationOccurred else { return }
+            didTimeout = true
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+
+            if didTimeout {
+                PerformanceMonitor.shared.logDebug("getDevices: 文本格式超时")
+                return nil
+            }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else {
+                PerformanceMonitor.shared.logDebug("getDevices: 文本格式返回空")
+                return nil
+            }
+
+            // 使用空的缓存构建设备列表（因为我们需要真实 UDID）
+            let originalCache = self.deviceCache
+            self.deviceCache = []  // 临时清空，确保生成真实 UDID
+            let devices = parseTextFormatDevices(output)
+            self.deviceCache = originalCache  // 恢复缓存
+            return devices
+        } catch {
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+            PerformanceMonitor.shared.logDebug("getDevices: 文本格式失败 - \(error.localizedDescription)")
+            return nil
         }
     }
     

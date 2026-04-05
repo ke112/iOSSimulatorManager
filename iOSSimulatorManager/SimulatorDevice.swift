@@ -11,6 +11,8 @@ struct SimulatorDevice: Identifiable {
   let screenSize: Double
   let resolution: String  // 物理分辨率
   let logicalResolution: String  // 屏幕点(逻辑分辨率)
+  /// 是否为占位设备（当 JSON 格式失败回退到文本格式时，无法获取真实 UDID 的设备）
+  let isPlaceholder: Bool
 
   /// 设备类型: iPhone或iPad
   enum DeviceType {
@@ -24,13 +26,15 @@ struct SimulatorDevice: Identifiable {
     name: String,
     state: String,
     runtime: String,
-    deviceTypeIdentifier: String? = nil
+    deviceTypeIdentifier: String? = nil,
+    isPlaceholder: Bool = false
   ) {
     id = udid
     self.udid = udid
     self.name = name
     self.state = state
     self.runtime = runtime
+    self.isPlaceholder = isPlaceholder
 
     // 使用配置管理器获取设备信息（优先通过 UDID 解析设备类型，其次按名称）
     if let spec =
@@ -76,5 +80,6 @@ struct SimulatorDevice: Identifiable {
     screenSize = device.screenSize
     resolution = device.resolution
     logicalResolution = device.logicalResolution
+    isPlaceholder = device.isPlaceholder
   }
 }

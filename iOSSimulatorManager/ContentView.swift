@@ -64,6 +64,7 @@ struct LoadingView: View {
 // 空状态视图
 struct EmptyStateView: View {
     let onRefresh: () -> Void
+    var isAutoRefreshPaused: Bool = false
 
     var body: some View {
         VStack(spacing: 24) {
@@ -79,11 +80,19 @@ struct EmptyStateView: View {
                         .fontWeight(.semibold)
                         .foregroundColor(.primary)
 
-                    Text("请在 Xcode 中创建 iOS 模拟器设备，\n或点击刷新重新检测设备")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineSpacing(2)
+                    if isAutoRefreshPaused {
+                        Text("自动刷新已暂停（CoreSimulator 可能异常）\n请点击下方刷新按钮尝试恢复")
+                            .font(.subheadline)
+                            .foregroundColor(.orange)
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(2)
+                    } else {
+                        Text("请在 Xcode 中创建 iOS 模拟器设备，\n或点击刷新重新检测设备")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .lineSpacing(2)
+                    }
                 }
             }
 
@@ -191,8 +200,8 @@ struct ContentView: View {
             } else if simulatorManager.deviceGroups.isEmpty {
                 // 空状态
                 EmptyStateView(onRefresh: {
-                    simulatorManager.forceRefresh()
-                })
+                    simulatorManager.manualResumeAutoRefresh()
+                }, isAutoRefreshPaused: simulatorManager.isAutoRefreshPaused)
             } else {
                 // 设备列表
                 List {
