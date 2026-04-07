@@ -483,21 +483,30 @@ class SimulatorManager: ObservableObject, ErrorHandler {
     /// 解析单行设备信息
     private func parseTextDeviceLine(_ line: String, runtime: String, existingDevicesMap: [String: SimulatorDevice]) -> SimulatorDevice? {
         // 格式: "iPhone 16 Pro (UDID) (Shutdown)" 或 "iPhone SE (3rd generation) (UDID) (Booted)"
-        // 第二个括号是 UDID，最后一个括号是状态
+        // 最后两个括号分别是 UDID 和状态（名称中间可能有括号）
 
-        // 找到倒数第二个和倒数第一个左括号（分别对应 UDID 和状态）
+        // 从右往左找：最后一个左括号是状态的开始
         guard let lastOpenParen = line.lastIndex(of: "("),
-              let secondLastOpenParen = line[..<lastOpenParen].lastIndex(of: "("),
               let lastCloseParen = line.lastIndex(of: ")") else {
             return nil
         }
 
-        // 提取 UDID
-        let udid = String(line[line.index(after: secondLastOpenParen)..<lastOpenParen])
-            .trimmingCharacters(in: .whitespaces)
-
         // 提取状态
         let stateStr = String(line[line.index(after: lastOpenParen)..<lastCloseParen])
+            .trimmingCharacters(in: .whitespaces)
+
+        // 从右往左找：倒数第二个左括号是 UDID 的开始
+        // 位置在 lastOpenParen 之前
+        let beforeLastOpen = String(line[..<lastOpenParen])
+        guard let secondLastOpenParen = beforeLastOpen.lastIndex(of: "(") else {
+            return nil
+        }
+
+        // 提取 UDID：找到 UDID 左括号对应的右括号
+        guard let udidCloseParen = beforeLastOpen[beforeLastOpen.index(after: secondLastOpenParen)...].firstIndex(of: ")") else {
+            return nil
+        }
+        let udid = String(beforeLastOpen[beforeLastOpen.index(after: secondLastOpenParen)..<udidCloseParen])
             .trimmingCharacters(in: .whitespaces)
 
         // 提取名称（从行首到 UDID 左括号之前）
@@ -513,8 +522,8 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             state = "Shutdown"
         }
 
-        // 验证 UDID 格式是否有效（应该是类似 UUID 的格式）
-        let isValidUDID = udid.count == 36 && udid.contains("-")
+        // 验证 UDID 格式是否有效（应该是类似 UUID 的格式：8-4-4-4-12）
+        let isValidUDID = udid.count == 36 && udid.filter { $0 == "-" }.count == 4
 
         if isValidUDID {
             // 使用真实 UDID
@@ -1101,8 +1110,19 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 PerformanceMonitor.shared.logInfo("找到 \(devicesToDelete.count) 台设备需要删除")
             }
 
-            // 2. 删除所有设备
-            for device in devicesToDelete {
+            // 2. 过滤掉占位设备（无真实 UDID 的设备无法删除）
+            let realDevices = devicesToDelete.filter { !$0.isPlaceholder }
+            if realDevices.count < devicesToDelete.count {
+                let skipped = devicesToDelete.count - realDevices.count
+                PerformanceMonitor.shared.logInfo("跳过 \(skipped) 台占位设备（无真实 UDID，无法删除）")
+                if realDevices.isEmpty {
+                    PerformanceMonitor.shared.logInfo("所有设备均为占位设备，无法执行删除。请尝试重启 Xcode 后重试。")
+                    deletionSucceeded = false
+                }
+            }
+
+            // 3. 删除所有真实设备
+            for device in realDevices {
                 PerformanceMonitor.shared.logInfo("正在删除设备: \(device.name) (UDID: \(device.udid), State: \(device.state))")
 
                 // 如果设备正在运行，先关闭
@@ -1126,7 +1146,7 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 }
             }
 
-            // 3. 如果需要，删除 Runtime 镜像
+            // 4. 如果需要，删除 Runtime 镜像
             if deleteRuntime {
                 // 等待设备删除完成
                 Thread.sleep(forTimeInterval: 1.0)
@@ -1158,16 +1178,28 @@ class SimulatorManager: ObservableObject, ErrorHandler {
 
     /// 直接从系统获取指定 runtime 的所有设备（不依赖缓存）
     private func getDevicesForRuntime(_ runtime: String) -> [SimulatorDevice] {
+        PerformanceMonitor.shared.logInfo("getDevicesForRuntime: 开始获取 runtime=\(runtime) 的设备")
+
         // 优先尝试 JSON 格式
         if let devices = tryGetDevicesJsonFormat(timeoutSeconds: 8.0) {
-            return devices.filter { $0.runtime == runtime }
+            let filtered = devices.filter { $0.runtime == runtime }
+            PerformanceMonitor.shared.logInfo("getDevicesForRuntime: JSON 成功，获取到 \(devices.count) 台设备，过滤后 \(filtered.count) 台属于 \(runtime)")
+            return filtered
         }
 
         // JSON 失败，尝试文本格式
-        if let devices = tryGetDevicesTextFormat(timeoutSeconds: 10.0) {
-            return devices.filter { $0.runtime == runtime }
+        PerformanceMonitor.shared.logInfo("getDevicesForRuntime: JSON 失败，尝试文本格式...")
+        if let devices = tryGetDevicesTextFormat(timeoutSeconds: 15.0) {
+            let filtered = devices.filter { $0.runtime == runtime }
+            PerformanceMonitor.shared.logInfo("getDevicesForRuntime: 文本成功，获取到 \(devices.count) 台设备，过滤后 \(filtered.count) 台属于 \(runtime)")
+            // 打印前几台设备的信息用于调试
+            for (index, device) in filtered.prefix(3).enumerated() {
+                PerformanceMonitor.shared.logInfo("  设备\(index): name=\(device.name), udid=\(device.udid), state=\(device.state), isPlaceholder=\(device.isPlaceholder)")
+            }
+            return filtered
         }
 
+        PerformanceMonitor.shared.logInfo("getDevicesForRuntime: JSON 和文本格式都失败，返回空数组")
         return []
     }
 
@@ -1200,23 +1232,28 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             timeoutWorkItem.cancel()
 
             if didTimeout {
-                PerformanceMonitor.shared.logDebug("getDevices: JSON 格式超时")
+                PerformanceMonitor.shared.logInfo("getDevices: JSON 格式超时（\(Int(timeoutSeconds))秒）")
                 return nil
             }
 
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
             if data.isEmpty {
-                PerformanceMonitor.shared.logDebug("getDevices: JSON 格式返回空")
+                PerformanceMonitor.shared.logInfo("getDevices: JSON 格式返回空数据")
                 return nil
             }
 
+            PerformanceMonitor.shared.logInfo("getDevices: JSON 格式成功，获取到 \(data.count) 字节")
+
             let decoder = JSONDecoder()
             let result = try decoder.decode(SimctlListResponse.self, from: data)
-            return buildSortedDevices(from: result)
+            let devices = buildSortedDevices(from: result)
+            PerformanceMonitor.shared.logInfo("getDevices: JSON 解析出 \(devices.count) 台设备")
+            return devices
         } catch {
             terminationOccurred = true
             timeoutWorkItem.cancel()
-            PerformanceMonitor.shared.logDebug("getDevices: JSON 格式失败 - \(error.localizedDescription)")
+            PerformanceMonitor.shared.logInfo("getDevices: JSON 格式失败 - \(error.localizedDescription)")
             return nil
         }
     }
@@ -1250,21 +1287,26 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             timeoutWorkItem.cancel()
 
             if didTimeout {
-                PerformanceMonitor.shared.logDebug("getDevices: 文本格式超时")
+                PerformanceMonitor.shared.logInfo("getDevices: 文本格式超时（\(Int(timeoutSeconds))秒）")
                 return nil
             }
 
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
             guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else {
-                PerformanceMonitor.shared.logDebug("getDevices: 文本格式返回空")
+                PerformanceMonitor.shared.logInfo("getDevices: 文本格式返回空数据")
                 return nil
             }
+
+            PerformanceMonitor.shared.logInfo("getDevices: 文本格式成功，获取到 \(output.count) 字符")
 
             // 使用空的缓存构建设备列表（因为我们需要真实 UDID）
             let originalCache = self.deviceCache
             self.deviceCache = []  // 临时清空，确保生成真实 UDID
             let devices = parseTextFormatDevices(output)
             self.deviceCache = originalCache  // 恢复缓存
+
+            PerformanceMonitor.shared.logInfo("getDevices: 文本格式解析出 \(devices.count) 台设备")
             return devices
         } catch {
             terminationOccurred = true
