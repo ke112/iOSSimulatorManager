@@ -1151,14 +1151,10 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 // 等待设备删除完成
                 Thread.sleep(forTimeInterval: 1.0)
 
-                // 获取 Runtime UUID 并删除
-                if let runtimeUUID = self.getRuntimeUUID(for: runtime) {
-                    PerformanceMonitor.shared.logInfo("删除 Runtime UUID: \(runtimeUUID)")
-                    if self.deleteRuntimeWithPrivileges(uuid: runtimeUUID) == false {
-                        deletionSucceeded = false
-                    }
-                } else {
-                    PerformanceMonitor.shared.logInfo("获取 Runtime UUID 失败")
+                // 获取 Runtime 删除标识并删除
+                let deletionIdentifier = self.getRuntimeDeletionIdentifier(for: runtime)
+                PerformanceMonitor.shared.logInfo("删除 Runtime 标识: \(deletionIdentifier)")
+                if self.deleteRuntimeWithPrivileges(identifier: deletionIdentifier) == false {
                     deletionSucceeded = false
                 }
             }
@@ -1316,10 +1312,14 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         }
     }
     
-    /// 获取 Runtime 的 UUID
+    /// 获取 Runtime 删除标识。
+    ///
+    /// `simctl runtime delete` 对 disk image runtime 需要 image UUID。不同 Xcode
+    /// 版本的 `simctl runtime list -j` JSON 结构不完全一致，这里递归匹配 runtime 信息；
+    /// 如果拿不到 image UUID，则回退使用传入的 runtime identifier。
     /// - Parameter runtimeIdentifier: runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
-    /// - Returns: Runtime 的 UUID，如 "1F27DC46-D37C-4CC2-A186-BE0931583640"
-    private func getRuntimeUUID(for runtimeIdentifier: String) -> String? {
+    /// - Returns: Runtime 删除标识，优先 UUID，其次 runtime identifier
+    private func getRuntimeDeletionIdentifier(for runtimeIdentifier: String) -> String {
         do {
             let process = Process()
             let pipe = Pipe()
@@ -1334,27 +1334,62 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             
-            // 解析 JSON 获取 UUID
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
-                for (uuid, info) in json {
-                    if let identifier = info["runtimeIdentifier"] as? String,
-                       identifier == runtimeIdentifier {
-                        return uuid
-                    }
-                }
+            let json = try JSONSerialization.jsonObject(with: data)
+            if let deletionIdentifier = findRuntimeDeletionIdentifier(in: json, matching: runtimeIdentifier) {
+                return deletionIdentifier
             }
         } catch {
-            print("获取 Runtime UUID 失败: \(error.localizedDescription)")
+            print("获取 Runtime 删除标识失败: \(error.localizedDescription)")
         }
+        return runtimeIdentifier
+    }
+
+    private func findRuntimeDeletionIdentifier(in value: Any, matching runtimeIdentifier: String) -> String? {
+        if let dictionary = value as? [String: Any] {
+            let identifiers = [
+                dictionary["runtimeIdentifier"],
+                dictionary["bundleIdentifier"],
+                dictionary["identifier"],
+            ].compactMap { $0 as? String }
+
+            if identifiers.contains(runtimeIdentifier) {
+                return runtimeDeletionIdentifier(from: dictionary, fallback: runtimeIdentifier)
+            }
+
+            for child in dictionary.values {
+                if let identifier = findRuntimeDeletionIdentifier(in: child, matching: runtimeIdentifier) {
+                    return identifier
+                }
+            }
+        } else if let array = value as? [Any] {
+            for child in array {
+                if let identifier = findRuntimeDeletionIdentifier(in: child, matching: runtimeIdentifier) {
+                    return identifier
+                }
+            }
+        }
+
         return nil
+    }
+
+    private func runtimeDeletionIdentifier(from dictionary: [String: Any], fallback: String) -> String {
+        let candidates = [
+            dictionary["uuid"],
+            dictionary["UUID"],
+            dictionary["imageIdentifier"],
+            dictionary["identifier"],
+        ].compactMap { $0 as? String }
+
+        return candidates.first { $0 != fallback } ?? fallback
     }
     
     /// 使用管理员权限删除 Runtime
-    /// - Parameter uuid: Runtime 的 UUID
-    private func deleteRuntimeWithPrivileges(uuid: String) -> Bool {
+    /// - Parameter identifier: Runtime 删除标识
+    private func deleteRuntimeWithPrivileges(identifier: String) -> Bool {
         // 使用 AppleScript 请求管理员权限执行删除命令
+        let escapedIdentifier = identifier.replacingOccurrences(of: "'", with: "'\\''")
         let script = """
-        do shell script "xcrun simctl runtime delete \(uuid)" with administrator privileges
+        do shell script "xcrun simctl runtime delete '\(escapedIdentifier)'" with administrator privileges
         """
         
         var error: NSDictionary?
@@ -1363,12 +1398,13 @@ class SimulatorManager: ObservableObject, ErrorHandler {
             
             if let error = error {
                 print("删除 Runtime 失败: \(error)")
+                let errorMessage = (error[NSAppleScript.errorMessage] as? String) ?? "\(error)"
                 DispatchQueue.main.async {
-                    self.handleError(SimulatorError.commandExecutionFailed("删除 Runtime 失败，可能需要手动执行: sudo xcrun simctl runtime delete \(uuid)"))
+                    self.handleError(SimulatorError.commandExecutionFailed("删除 Runtime 失败：\(errorMessage)。可手动执行: sudo xcrun simctl runtime delete \(identifier)"))
                 }
                 return false
             } else {
-                print("Runtime \(uuid) 删除成功")
+                print("Runtime \(identifier) 删除成功")
                 return true
             }
         }
