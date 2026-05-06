@@ -267,7 +267,12 @@ struct ContentView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .disabled(isDeletingRuntime)
-                                .help(isDeletingRuntime ? deleteProgressText : "删除该版本的所有模拟器")
+                                .help(
+                                    isDeletingRuntime
+                                        ? deleteProgressText
+                                        : group.devices.isEmpty
+                                        ? "彻底删除该版本 Runtime 镜像"
+                                        : "删除该版本的模拟器或 Runtime")
                             }
                         ) {
                             if group.devices.isEmpty {
@@ -364,8 +369,8 @@ struct ContentView: View {
             isPresented: $showingDeleteConfirm,
             titleVisibility: .visible
         ) {
-            Button("仅删除模拟器设备", role: .destructive) {
-                if let group = runtimeToDelete {
+            if let group = runtimeToDelete, !group.devices.isEmpty {
+                Button("仅删除模拟器设备", role: .destructive) {
                     simulatorManager.deleteDevicesForRuntime(group.runtime, deleteRuntime: false) {
                         success in
                         toastMessage =
@@ -380,8 +385,8 @@ struct ContentView: View {
                     withAnimation {
                         showingToast = true
                     }
+                    runtimeToDelete = nil
                 }
-                runtimeToDelete = nil
             }
             Button("彻底删除（含 Runtime 镜像）", role: .destructive) {
                 if let group = runtimeToDelete {
@@ -407,7 +412,11 @@ struct ContentView: View {
             }
         } message: {
             if let group = runtimeToDelete {
-                Text("共 \(group.devices.count) 个设备\n\n• 仅删除设备：删除模拟器及其数据\n• 彻底删除：同时删除 iOS Runtime 镜像（释放 5-10GB 空间）")
+                if group.devices.isEmpty {
+                    Text("当前没有模拟器设备，只剩 \(group.displayName) Runtime 镜像。\n\n彻底删除会卸载该 Runtime 并释放约 5-10GB 空间。")
+                } else {
+                    Text("共 \(group.devices.count) 个设备\n\n• 仅删除设备：删除模拟器及其数据\n• 彻底删除：同时删除 iOS Runtime 镜像（释放 5-10GB 空间）")
+                }
             }
         }
     }

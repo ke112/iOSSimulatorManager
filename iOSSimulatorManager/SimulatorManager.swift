@@ -1154,7 +1154,7 @@ class SimulatorManager: ObservableObject, ErrorHandler {
                 // 获取 Runtime 删除标识并删除
                 let deletionIdentifier = self.getRuntimeDeletionIdentifier(for: runtime)
                 PerformanceMonitor.shared.logInfo("删除 Runtime 标识: \(deletionIdentifier)")
-                if self.deleteRuntimeWithPrivileges(identifier: deletionIdentifier) == false {
+                if self.deleteRuntime(identifier: deletionIdentifier, runtimeIdentifier: runtime) == false {
                     deletionSucceeded = false
                 }
             }
@@ -1383,32 +1383,104 @@ class SimulatorManager: ObservableObject, ErrorHandler {
         return candidates.first { $0 != fallback } ?? fallback
     }
     
-    /// 使用管理员权限删除 Runtime
-    /// - Parameter identifier: Runtime 删除标识
-    private func deleteRuntimeWithPrivileges(identifier: String) -> Bool {
-        // 使用 AppleScript 请求管理员权限执行删除命令
-        let escapedIdentifier = identifier.replacingOccurrences(of: "'", with: "'\\''")
-        let script = """
-        do shell script "xcrun simctl runtime delete '\(escapedIdentifier)'" with administrator privileges
-        """
-        
-        var error: NSDictionary?
-        if let appleScript = NSAppleScript(source: script) {
-            appleScript.executeAndReturnError(&error)
-            
-            if let error = error {
-                print("删除 Runtime 失败: \(error)")
-                let errorMessage = (error[NSAppleScript.errorMessage] as? String) ?? "\(error)"
-                DispatchQueue.main.async {
-                    self.handleError(SimulatorError.commandExecutionFailed("删除 Runtime 失败：\(errorMessage)。可手动执行: sudo xcrun simctl runtime delete \(identifier)"))
-                }
-                return false
-            } else {
-                print("Runtime \(identifier) 删除成功")
-                return true
+    /// 删除 Runtime 镜像。
+    /// `simctl runtime delete` 需要 runtime disk image UUID，且应以当前用户执行；
+    /// 通过 AppleScript 提权执行会切到 root 的 CoreSimulator 上下文，可能返回成功但没有删除当前用户看到的 Runtime。
+    /// - Parameters:
+    ///   - identifier: Runtime disk image 删除标识
+    ///   - runtimeIdentifier: Runtime 标识符，如 "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
+    private func deleteRuntime(identifier: String, runtimeIdentifier: String) -> Bool {
+        let result = runSimctlCommand(arguments: ["runtime", "delete", identifier], timeoutSeconds: 120.0)
+
+        guard result.succeeded else {
+            let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = output.isEmpty ? "退出码 \(result.terminationStatus)" : output
+            PerformanceMonitor.shared.logInfo("删除 Runtime 失败: \(message)")
+            DispatchQueue.main.async {
+                self.handleError(SimulatorError.commandExecutionFailed("删除 Runtime 失败：\(message)。可手动执行: xcrun simctl runtime delete \(identifier)"))
             }
+            return false
+        }
+
+        if waitUntilRuntimeDeleted(runtimeIdentifier, timeoutSeconds: 60.0) {
+            PerformanceMonitor.shared.logInfo("Runtime \(identifier) 删除成功")
+            return true
+        }
+
+        let message = "删除命令已执行，但系统仍报告 Runtime 存在"
+        PerformanceMonitor.shared.logInfo("\(message): \(runtimeIdentifier)")
+        DispatchQueue.main.async {
+            self.handleError(SimulatorError.commandExecutionFailed("\(message)。可手动执行: xcrun simctl runtime delete \(identifier)"))
         }
         return false
+    }
+
+    private struct SimctlCommandResult {
+        let terminationStatus: Int32
+        let output: String
+
+        var succeeded: Bool {
+            terminationStatus == 0
+        }
+    }
+
+    private func runSimctlCommand(arguments: [String], timeoutSeconds: Double) -> SimctlCommandResult {
+        let process = Process()
+        let pipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl"] + arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var didTimeout = false
+        var terminationOccurred = false
+
+        let timeoutWorkItem = DispatchWorkItem { [weak process] in
+            guard let process = process, !terminationOccurred else { return }
+            didTimeout = true
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: timeoutWorkItem)
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+
+            if didTimeout {
+                return SimctlCommandResult(terminationStatus: -1, output: "命令执行超时（\(Int(timeoutSeconds))秒）")
+            }
+
+            return SimctlCommandResult(terminationStatus: process.terminationStatus, output: output)
+        } catch {
+            terminationOccurred = true
+            timeoutWorkItem.cancel()
+            return SimctlCommandResult(terminationStatus: -1, output: error.localizedDescription)
+        }
+    }
+
+    private func waitUntilRuntimeDeleted(_ runtimeIdentifier: String, timeoutSeconds: Double) -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+
+        repeat {
+            if !isRuntimeInstalled(runtimeIdentifier) {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 1.0)
+        } while Date() < deadline
+
+        return false
+    }
+
+    private func isRuntimeInstalled(_ runtimeIdentifier: String) -> Bool {
+        getInstalledRuntimes().contains(runtimeIdentifier)
     }
 
     /// 在 Finder 中显示当前 Runtime 下的模拟器设备目录
